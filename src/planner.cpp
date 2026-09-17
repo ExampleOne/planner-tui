@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <ctime>
 #include <cstdlib>
 #include <filesystem>
@@ -61,6 +62,23 @@ std::string status_db(Status status) {
         return static_cast<char>(std::tolower(c));
     });
     return result;
+}
+
+long long civil_day_number(const std::string& value) {
+    if (value.size() != 10 || value[4] != '-' || value[7] != '-')
+        throw std::runtime_error("Invalid date; expected YYYY-MM-DD");
+    int year = std::stoi(value.substr(0, 4));
+    const unsigned month = static_cast<unsigned>(std::stoi(value.substr(5, 2)));
+    const unsigned day = static_cast<unsigned>(std::stoi(value.substr(8, 2)));
+    if (month < 1 || month > 12 || day < 1 || day > 31)
+        throw std::runtime_error("Invalid date; expected YYYY-MM-DD");
+    year -= month <= 2;
+    const long long era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned year_of_era = static_cast<unsigned>(year - era * 400);
+    const unsigned adjusted_month = month > 2 ? month - 3 : month + 9;
+    const unsigned day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    const unsigned day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    return era * 146097 + day_of_era;
 }
 
 }  // namespace
@@ -137,6 +155,58 @@ std::string todo_title_on(const State& state, const Todo& todo, const std::strin
     return exception != state.todo_exceptions.end() && !exception->title.empty() ? exception->title : todo.title;
 }
 
+double goal_daily_target_on(const State& state, const Goal& goal, const std::string& date) {
+    double result = goal.daily_goal;
+    std::string latest;
+    for (const auto& change : state.goal_daily_targets) {
+        if (change.goal_id == goal.id && change.effective_date <= date &&
+            (latest.empty() || change.effective_date >= latest)) {
+            result = change.amount;
+            latest = change.effective_date;
+        }
+    }
+    return result;
+}
+
+double goal_expected_on(const State& state, const Goal& goal, const std::string& date) {
+    if (date < goal.start_date) return 0;
+    std::string pace_start = goal.start_date;
+    double expected = 0;
+    for (const auto& reset : state.goal_pace_resets) {
+        if (reset.goal_id == goal.id && reset.effective_date <= date && reset.effective_date >= pace_start) {
+            pace_start = reset.effective_date;
+            expected = reset.baseline;
+        }
+    }
+    const long long end = civil_day_number(date);
+    long long cursor = civil_day_number(pace_start);
+    double daily_target = goal_daily_target_on(state, goal, pace_start);
+    for (const auto& change : state.goal_daily_targets) {
+        if (change.goal_id != goal.id || change.effective_date <= pace_start ||
+            change.effective_date > date) continue;
+        const long long next = civil_day_number(change.effective_date);
+        expected += daily_target * std::max<long long>(0, next - cursor);
+        daily_target = change.amount;
+        cursor = next;
+    }
+    return expected + daily_target * std::max<long long>(0, end - cursor + 1);
+}
+
+bool goal_complete_on(const State& state, const Goal& goal, const std::string& date) {
+    if (goal.target <= 0) return false;
+    double total = 0;
+    for (const auto& entry : state.goal_entries)
+        if (entry.goal_id == goal.id && entry.date <= date) total += entry.amount;
+    return total >= goal.target;
+}
+
+double book_current_page_on(const State& state, const Goal& goal, const std::string& date) {
+    double current = goal.start_page;
+    for (const auto& entry : state.goal_entries)
+        if (entry.goal_id == goal.id && entry.date <= date) current += entry.amount;
+    return current;
+}
+
 long long active_seconds(const State& state, int task_id) {
     if (!state.timer_task_id || *state.timer_task_id != task_id || !state.timer_started_at) return 0;
     return std::max<long long>(0, std::chrono::duration_cast<std::chrono::seconds>(
@@ -176,6 +246,60 @@ TimePoint parse_time(const std::string& value) {
     if (in.fail()) throw std::runtime_error("Invalid time; expected YYYY-MM-DDTHH:MM:SS");
     tm.tm_isdst = -1;
     return Clock::from_time_t(mktime(&tm));
+}
+
+TimePoint resolve_split_time(TimePoint midpoint, TimePoint tracker_date,
+                             const std::string& entered_date, const std::string& entered_time) {
+    if (entered_date.empty() && entered_time.empty()) return midpoint;
+
+    std::string split_time = entered_time;
+    if (split_time.empty()) {
+        const std::time_t value = Clock::to_time_t(midpoint);
+        std::tm tm{};
+        localtime_r(&value, &tm);
+        std::ostringstream out;
+        out << std::put_time(&tm, "%H:%M");
+        split_time = out.str();
+    }
+    return parse_time((entered_date.empty() ? date_iso(tracker_date) : entered_date) +
+                      "T" + split_time + ":00");
+}
+
+std::vector<int> spread_timeline_marks(const std::vector<int>& preferred, int width) {
+    if (preferred.empty() || width <= 0) return {};
+    std::vector<int> result;
+    result.reserve(preferred.size());
+    const int count = static_cast<int>(preferred.size());
+    for (int i = 0; i < count; ++i) {
+        const int low = count <= width ? i : 0;
+        const int high = count <= width ? width - count + i : width - 1;
+        int mark = std::clamp(preferred[i], low, high);
+        if (count <= width && !result.empty()) mark = std::max(mark, result.back() + 1);
+        result.push_back(std::clamp(mark, 0, width - 1));
+    }
+    return result;
+}
+
+char activity_symbol(int id, bool allowance, bool sleep) {
+    if (sleep) return 'z';
+    if (allowance) return '~';
+    static constexpr char symbols[] = "=+#*@%&:;";
+    const unsigned value = static_cast<unsigned>(id < 0 ? -static_cast<long long>(id) : id);
+    return symbols[(value / 7u) % (sizeof(symbols) - 1)];
+}
+
+bool activity_matches_query(const Task& task, const Project* project, const std::string& query) {
+    if (query.empty()) return true;
+    auto lower = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return value;
+    };
+    const std::string needle = lower(query);
+    const std::string haystack = lower(task.title + " " + task.tags + " " +
+        (project ? project->name : std::string{}));
+    return haystack.find(needle) != std::string::npos;
 }
 
 void set_app_timezone(const std::string& timezone) {
@@ -335,11 +459,22 @@ void Store::initialize() {
             id INTEGER PRIMARY KEY, title TEXT NOT NULL, unit TEXT NOT NULL DEFAULT 'units',
             target REAL NOT NULL, daily_goal REAL NOT NULL DEFAULT 0,
             start_date TEXT NOT NULL, target_date TEXT NOT NULL,
-            comment TEXT NOT NULL DEFAULT ''
+            comment TEXT NOT NULL DEFAULT '', book_mode INTEGER NOT NULL DEFAULT 0,
+            start_page REAL NOT NULL DEFAULT 0, end_page REAL NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS goal_entries (
             id INTEGER PRIMARY KEY, goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
             date TEXT NOT NULL, amount REAL NOT NULL, note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS goal_daily_targets (
+            goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            effective_date TEXT NOT NULL, daily_goal REAL NOT NULL,
+            PRIMARY KEY(goal_id,effective_date)
+        );
+        CREATE TABLE IF NOT EXISTS goal_pace_resets (
+            goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+            effective_date TEXT NOT NULL, baseline REAL NOT NULL,
+            PRIMARY KEY(goal_id,effective_date)
         );
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL
@@ -374,8 +509,17 @@ void Store::initialize() {
         exec(impl_->db, "ALTER TABLE goals ADD COLUMN daily_goal REAL NOT NULL DEFAULT 0");
     if (!has_column(impl_->db, "goals", "comment"))
         exec(impl_->db, "ALTER TABLE goals ADD COLUMN comment TEXT NOT NULL DEFAULT ''");
+    if (!has_column(impl_->db, "goals", "book_mode"))
+        exec(impl_->db, "ALTER TABLE goals ADD COLUMN book_mode INTEGER NOT NULL DEFAULT 0");
+    if (!has_column(impl_->db, "goals", "start_page"))
+        exec(impl_->db, "ALTER TABLE goals ADD COLUMN start_page REAL NOT NULL DEFAULT 0");
+    if (!has_column(impl_->db, "goals", "end_page"))
+        exec(impl_->db, "ALTER TABLE goals ADD COLUMN end_page REAL NOT NULL DEFAULT 0");
     exec(impl_->db, "UPDATE goals SET daily_goal=target/MAX(1,julianday(target_date)-julianday(start_date)+1) "
-                    "WHERE daily_goal<=0 AND target_date<>''");
+                    "WHERE daily_goal<=0 AND target_date<>'' AND book_mode=0");
+    exec(impl_->db, "INSERT INTO goal_daily_targets(goal_id,effective_date,daily_goal) "
+                    "SELECT id,start_date,daily_goal FROM goals WHERE NOT EXISTS "
+                    "(SELECT 1 FROM goal_daily_targets history WHERE history.goal_id=goals.id)");
     exec(impl_->db, "UPDATE todos SET series_id=id WHERE recurring=1 AND series_id=0");
 }
 
@@ -423,7 +567,8 @@ State Store::load(TimePoint now) {
             sqlite3_column_int(statement, 3) != 0});
     sqlite3_finalize(statement);
     check(sqlite3_prepare_v2(impl_->db,
-        "SELECT id,title,unit,target,daily_goal,start_date,target_date,comment FROM goals ORDER BY id", -1,
+        "SELECT id,title,unit,target,daily_goal,start_date,target_date,comment,book_mode,start_page,end_page "
+        "FROM goals ORDER BY id", -1,
         &statement, nullptr), impl_->db, "load goals");
     while (sqlite3_step(statement) == SQLITE_ROW)
         state.goals.push_back({sqlite3_column_int(statement, 0),
@@ -432,7 +577,9 @@ State Store::load(TimePoint now) {
             sqlite3_column_double(statement, 4),
             reinterpret_cast<const char*>(sqlite3_column_text(statement, 5)),
             reinterpret_cast<const char*>(sqlite3_column_text(statement, 6)),
-            reinterpret_cast<const char*>(sqlite3_column_text(statement, 7))});
+            reinterpret_cast<const char*>(sqlite3_column_text(statement, 7)),
+            sqlite3_column_int(statement, 8) != 0, sqlite3_column_double(statement, 9),
+            sqlite3_column_double(statement, 10)});
     sqlite3_finalize(statement);
     check(sqlite3_prepare_v2(impl_->db,
         "SELECT id,goal_id,date,amount,note FROM goal_entries ORDER BY date,id", -1,
@@ -441,6 +588,20 @@ State Store::load(TimePoint now) {
         state.goal_entries.push_back({sqlite3_column_int(statement, 0), sqlite3_column_int(statement, 1),
             reinterpret_cast<const char*>(sqlite3_column_text(statement, 2)), sqlite3_column_double(statement, 3),
             reinterpret_cast<const char*>(sqlite3_column_text(statement, 4))});
+    sqlite3_finalize(statement);
+    check(sqlite3_prepare_v2(impl_->db,
+        "SELECT goal_id,effective_date,daily_goal FROM goal_daily_targets ORDER BY goal_id,effective_date", -1,
+        &statement, nullptr), impl_->db, "load goal daily targets");
+    while (sqlite3_step(statement) == SQLITE_ROW)
+        state.goal_daily_targets.push_back({sqlite3_column_int(statement, 0),
+            reinterpret_cast<const char*>(sqlite3_column_text(statement, 1)), sqlite3_column_double(statement, 2)});
+    sqlite3_finalize(statement);
+    check(sqlite3_prepare_v2(impl_->db,
+        "SELECT goal_id,effective_date,baseline FROM goal_pace_resets ORDER BY goal_id,effective_date", -1,
+        &statement, nullptr), impl_->db, "load goal pace resets");
+    while (sqlite3_step(statement) == SQLITE_ROW)
+        state.goal_pace_resets.push_back({sqlite3_column_int(statement, 0),
+            reinterpret_cast<const char*>(sqlite3_column_text(statement, 1)), sqlite3_column_double(statement, 2)});
     sqlite3_finalize(statement);
     check(sqlite3_prepare_v2(impl_->db,
         "SELECT todo_id,date FROM todo_completions ORDER BY date,todo_id", -1,
@@ -1043,10 +1204,11 @@ int Store::split_todo_from(int todo_id, const std::string& date, const std::stri
 
 int Store::add_goal(const std::string& title, const std::string& unit, double target,
                     const std::string& start_date, const std::string& target_date, double daily_goal,
-                    const std::string& comment) {
+                    const std::string& comment, bool book_mode, double start_page, double end_page) {
     sqlite3_stmt* statement = nullptr;
     check(sqlite3_prepare_v2(impl_->db,
-        "INSERT INTO goals(title,unit,target,daily_goal,start_date,target_date,comment) VALUES(?,?,?,?,?,?,?)", -1,
+        "INSERT INTO goals(title,unit,target,daily_goal,start_date,target_date,comment,book_mode,start_page,end_page) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)", -1,
         &statement, nullptr), impl_->db, "prepare goal");
     sqlite3_bind_text(statement, 1, title.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(statement, 2, unit.c_str(), -1, SQLITE_TRANSIENT);
@@ -1055,15 +1217,37 @@ int Store::add_goal(const std::string& title, const std::string& unit, double ta
     sqlite3_bind_text(statement, 5, start_date.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(statement, 6, target_date.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(statement, 7, comment.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(statement, 8, book_mode ? 1 : 0);
+    sqlite3_bind_double(statement, 9, start_page);
+    sqlite3_bind_double(statement, 10, end_page);
     check(sqlite3_step(statement), impl_->db, "add goal");
     sqlite3_finalize(statement);
-    return static_cast<int>(sqlite3_last_insert_rowid(impl_->db));
+    const int goal_id = static_cast<int>(sqlite3_last_insert_rowid(impl_->db));
+    check(sqlite3_prepare_v2(impl_->db,
+        "INSERT INTO goal_daily_targets(goal_id,effective_date,daily_goal) VALUES(?,?,?)", -1,
+        &statement, nullptr), impl_->db, "prepare initial goal daily target");
+    sqlite3_bind_int(statement, 1, goal_id);
+    sqlite3_bind_text(statement, 2, start_date.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(statement, 3, daily_goal);
+    check(sqlite3_step(statement), impl_->db, "add initial goal daily target");
+    sqlite3_finalize(statement);
+    return goal_id;
 }
 
-void Store::update_goal(const Goal& goal) {
+void Store::update_goal(const Goal& goal, const std::string& daily_goal_effective_date) {
     sqlite3_stmt* statement = nullptr;
+    check(sqlite3_prepare_v2(impl_->db, "SELECT daily_goal FROM goals WHERE id=?", -1,
+        &statement, nullptr), impl_->db, "prepare current goal daily target");
+    sqlite3_bind_int(statement, 1, goal.id);
+    if (sqlite3_step(statement) != SQLITE_ROW) {
+        sqlite3_finalize(statement);
+        throw std::runtime_error("Goal not found.");
+    }
+    const double previous_daily_goal = sqlite3_column_double(statement, 0);
+    sqlite3_finalize(statement);
     check(sqlite3_prepare_v2(impl_->db,
-        "UPDATE goals SET title=?,unit=?,target=?,daily_goal=?,start_date=?,target_date=?,comment=? WHERE id=?", -1,
+        "UPDATE goals SET title=?,unit=?,target=?,daily_goal=?,start_date=?,target_date=?,comment=?,"
+        "book_mode=?,start_page=?,end_page=? WHERE id=?", -1,
         &statement, nullptr), impl_->db, "prepare update goal");
     sqlite3_bind_text(statement, 1, goal.title.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(statement, 2, goal.unit.c_str(), -1, SQLITE_TRANSIENT);
@@ -1072,9 +1256,24 @@ void Store::update_goal(const Goal& goal) {
     sqlite3_bind_text(statement, 5, goal.start_date.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(statement, 6, goal.target_date.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(statement, 7, goal.comment.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(statement, 8, goal.id);
+    sqlite3_bind_int(statement, 8, goal.book_mode ? 1 : 0);
+    sqlite3_bind_double(statement, 9, goal.start_page);
+    sqlite3_bind_double(statement, 10, goal.end_page);
+    sqlite3_bind_int(statement, 11, goal.id);
     check(sqlite3_step(statement), impl_->db, "update goal");
     sqlite3_finalize(statement);
+    if (previous_daily_goal != goal.daily_goal) {
+        const std::string effective_date = daily_goal_effective_date.empty() ? goal.start_date : daily_goal_effective_date;
+        check(sqlite3_prepare_v2(impl_->db,
+            "INSERT INTO goal_daily_targets(goal_id,effective_date,daily_goal) VALUES(?,?,?) "
+            "ON CONFLICT(goal_id,effective_date) DO UPDATE SET daily_goal=excluded.daily_goal", -1,
+            &statement, nullptr), impl_->db, "prepare changed goal daily target");
+        sqlite3_bind_int(statement, 1, goal.id);
+        sqlite3_bind_text(statement, 2, effective_date.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(statement, 3, goal.daily_goal);
+        check(sqlite3_step(statement), impl_->db, "change goal daily target");
+        sqlite3_finalize(statement);
+    }
 }
 
 void Store::delete_goal(int goal_id) {
@@ -1083,6 +1282,19 @@ void Store::delete_goal(int goal_id) {
         impl_->db, "prepare delete goal");
     sqlite3_bind_int(statement, 1, goal_id);
     check(sqlite3_step(statement), impl_->db, "delete goal");
+    sqlite3_finalize(statement);
+}
+
+void Store::reset_goal_pace(int goal_id, const std::string& date, double baseline) {
+    sqlite3_stmt* statement = nullptr;
+    check(sqlite3_prepare_v2(impl_->db,
+        "INSERT INTO goal_pace_resets(goal_id,effective_date,baseline) VALUES(?,?,?) "
+        "ON CONFLICT(goal_id,effective_date) DO UPDATE SET baseline=excluded.baseline", -1,
+        &statement, nullptr), impl_->db, "prepare goal pace reset");
+    sqlite3_bind_int(statement, 1, goal_id);
+    sqlite3_bind_text(statement, 2, date.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(statement, 3, baseline);
+    check(sqlite3_step(statement), impl_->db, "reset goal pace");
     sqlite3_finalize(statement);
 }
 
@@ -1170,6 +1382,96 @@ int Store::add_session(int task_id, TimePoint started_at, TimePoint ended_at) {
     check(sqlite3_step(statement), impl_->db, "add manual session");
     sqlite3_finalize(statement);
     return static_cast<int>(sqlite3_last_insert_rowid(impl_->db));
+}
+
+int Store::split_session(int session_id, TimePoint split_at, int second_task_id) {
+    exec(impl_->db, "BEGIN IMMEDIATE");
+    try {
+        sqlite3_stmt* statement = nullptr;
+        check(sqlite3_prepare_v2(impl_->db,
+            "SELECT started_at,ended_at FROM sessions WHERE id=?", -1, &statement, nullptr),
+            impl_->db, "prepare session split lookup");
+        sqlite3_bind_int(statement, 1, session_id);
+        if (sqlite3_step(statement) != SQLITE_ROW) {
+            sqlite3_finalize(statement);
+            throw std::runtime_error("Session to split was not found");
+        }
+        const auto started_at = Clock::from_time_t(sqlite3_column_int64(statement, 0));
+        const bool running = sqlite3_column_type(statement, 1) == SQLITE_NULL;
+        const auto ended_at = running ? TimePoint{} : Clock::from_time_t(sqlite3_column_int64(statement, 1));
+        sqlite3_finalize(statement);
+        if (split_at <= started_at || (!running && split_at >= ended_at))
+            throw std::runtime_error("Split time must be strictly inside the interval");
+
+        check(sqlite3_prepare_v2(impl_->db, "UPDATE sessions SET ended_at=? WHERE id=?", -1,
+            &statement, nullptr), impl_->db, "prepare first split interval");
+        sqlite3_bind_int64(statement, 1, epoch(split_at));
+        sqlite3_bind_int(statement, 2, session_id);
+        check(sqlite3_step(statement), impl_->db, "finish first split interval");
+        sqlite3_finalize(statement);
+
+        check(sqlite3_prepare_v2(impl_->db,
+            "INSERT INTO sessions(task_id,started_at,ended_at) VALUES(?,?,?)", -1,
+            &statement, nullptr), impl_->db, "prepare second split interval");
+        sqlite3_bind_int(statement, 1, second_task_id);
+        sqlite3_bind_int64(statement, 2, epoch(split_at));
+        if (running) sqlite3_bind_null(statement, 3);
+        else sqlite3_bind_int64(statement, 3, epoch(ended_at));
+        check(sqlite3_step(statement), impl_->db, "create second split interval");
+        sqlite3_finalize(statement);
+        const int second_session_id = static_cast<int>(sqlite3_last_insert_rowid(impl_->db));
+        exec(impl_->db, "COMMIT");
+        return second_session_id;
+    } catch (...) {
+        exec(impl_->db, "ROLLBACK");
+        throw;
+    }
+}
+
+void Store::move_session_boundary(int left_session_id, int right_session_id, TimePoint boundary) {
+    exec(impl_->db, "BEGIN IMMEDIATE");
+    try {
+        sqlite3_stmt* statement = nullptr;
+        auto load_interval = [&](int id) {
+            check(sqlite3_prepare_v2(impl_->db,
+                "SELECT started_at,ended_at FROM sessions WHERE id=?", -1, &statement, nullptr),
+                impl_->db, "prepare boundary interval lookup");
+            sqlite3_bind_int(statement, 1, id);
+            if (sqlite3_step(statement) != SQLITE_ROW) {
+                sqlite3_finalize(statement);
+                throw std::runtime_error("Boundary interval was not found");
+            }
+            const auto start = Clock::from_time_t(sqlite3_column_int64(statement, 0));
+            const std::optional<TimePoint> end = sqlite3_column_type(statement, 1) == SQLITE_NULL ?
+                std::nullopt : std::optional<TimePoint>{Clock::from_time_t(sqlite3_column_int64(statement, 1))};
+            sqlite3_finalize(statement);
+            statement = nullptr;
+            return std::pair{start, end};
+        };
+        const auto [left_start, left_end] = load_interval(left_session_id);
+        const auto [right_start, right_end] = load_interval(right_session_id);
+        if (!left_end || *left_end != right_start)
+            throw std::runtime_error("Intervals do not share a boundary");
+        if (boundary <= left_start || (right_end && boundary >= *right_end))
+            throw std::runtime_error("Boundary must stay inside both intervals");
+
+        check(sqlite3_prepare_v2(impl_->db, "UPDATE sessions SET ended_at=? WHERE id=?", -1,
+            &statement, nullptr), impl_->db, "prepare left boundary move");
+        sqlite3_bind_int64(statement, 1, epoch(boundary));
+        sqlite3_bind_int(statement, 2, left_session_id);
+        check(sqlite3_step(statement), impl_->db, "move left interval boundary");
+        sqlite3_finalize(statement);
+        check(sqlite3_prepare_v2(impl_->db, "UPDATE sessions SET started_at=? WHERE id=?", -1,
+            &statement, nullptr), impl_->db, "prepare right boundary move");
+        sqlite3_bind_int64(statement, 1, epoch(boundary));
+        sqlite3_bind_int(statement, 2, right_session_id);
+        check(sqlite3_step(statement), impl_->db, "move right interval boundary");
+        sqlite3_finalize(statement);
+        exec(impl_->db, "COMMIT");
+    } catch (...) {
+        exec(impl_->db, "ROLLBACK");
+        throw;
+    }
 }
 
 void Store::update_session(int session_id, TimePoint started_at, TimePoint ended_at) {

@@ -105,21 +105,47 @@ fraction is the amount recorded on that date over the daily goal (for example `0
 and `[x]` appears only once the full daily target has been reached. Each row also shows
 the cumulative total through that date, expected current goal, and net position. Press
 `u` on a goal row to clear all of its datapoints for the displayed date; on a completed
-todo, `u` explicitly reopens it (`Space` also toggles ordinary todos).
+todo, `u` explicitly reopens it (`Space` also toggles ordinary todos). A goal with a final
+total leaves Daily Todos once its cumulative entries through the displayed date reach that
+total; it remains visible when browsing dates before completion. Daily-only goals remain active.
+Reading goals appear with a `{reading}` marker and show the absolute current and ending page,
+daily pages, expected cumulative goal, and net position. Recording one asks for the new
+current page; the app converts that position into pages read for the displayed date.
 also opens Views, while `Esc` from Task returns to the view that opened it. Tracker shows today's
 recorded intervals, including any interval that overlaps the selected day (overnight
 intervals are clipped and counted on both dates). `e` opens the selected interval so
 its task, start, or end can be changed; a running interval allows its task and start to
 be edited while End remains `RUNNING` (blank time input preserves the current value), and `n` adds a manual
 interval for the task most recently selected on the Board.
+Press `x` on a tracked interval to split it at an exact date and time. Entering a time
+with no date uses the day currently shown in Tracker, while leaving both prompts blank
+uses the exact midpoint. The split is saved before the activity picker opens; the picker
+assigns the second half (`Esc` keeps the same activity). Finished and running intervals
+can both be split. When two intervals touch,
+press `b` to open their shared-boundary editor. Use `h`/`l` for five-minute adjustments,
+`H`/`L` for fifteen minutes, or `e` for an exact date and time, then `Enter` to save.
+Both operations are atomic and undoable; moving a boundary preserves combined tracked time.
 The tracked-interval activity picker groups activities as Project folders containing
 status folders (`Backlog`, `Ready`, `Doing`, and `Done`). `j`/`k` moves between activities
 without selecting folder headings, and the tree scrolls automatically to keep the selected
-activity visible.
+activity visible. It opens with Search focused: type to filter by activity, tag, or project,
+press `Enter` to move into the results, then use `j`/`k` and `Enter` to choose. Press `/` from
+the result list to return to Search.
 The Tracker timeline bar maps intervals proportionally across the selected local day;
 task and allowance rows use matching stable colours, with `=` for task time and `~` for allowances.
+Compressed intervals are spread just enough to retain at least one distinct coloured mark for
+every activity represented that day.
+When task colours cycle, stable alternate symbols (`+`, `#`, `*`, and others) keep different
+activities visually distinct, including a newly assigned second half after splitting.
 Tasks whose title contains `sleep` always use a dedicated light tan/brown colour and `z`
 characters in the timeline.
+Press Down past the last tracked interval to focus the timeline. Its live marker shows the
+selected time; `h`/`l` moves by 15 minutes, `[`/`]` by 5 minutes, and `H`/`L` by one hour.
+At the marker, `x` splits the containing interval and `e` opens the containing activity's
+interval details. Press `b` to grab the nearest compatible shared boundary without leaving
+the timeline: the marker, boundary time, and adjacent coloured segments update together as
+you move. Press `Enter` to save the boundary or `Esc` to cancel it. Press Up to return to the
+interval list.
 Move above the first Tracker interval to focus its date; `h`/`l` or Left/Right changes
 the day, `g` returns to today, and `Enter` opens the calendar date selector.
 In Task editing, pressing `Enter` on Due date opens the same calendar-style selector;
@@ -141,11 +167,17 @@ the final goal total and final due date are optional. Press `+` to record a date
 the expected cumulative goal today, green/red net status, actual pace, projected finish,
 and recent datapoints. Total, current goal, net, and daily target also appear directly in
 every overview row, without requiring the goal to be selected.
+Press `r` to create a Reading goal by entering its title, starting page, ending page, current
+page, and daily page goal. Reading progress uses absolute page numbers: `+` and `Space` from
+Daily Todos ask where you are now, then retain the calculated pages read as dated history.
+The reading editor exposes Starting page, End page, Current page, and Daily pages. Like a
+regular daily target, changing Daily pages applies from today onward without changing history.
 Goal editing uses a field page like the Tracker interval editor: move between Name, Unit,
 Final goal, Daily goal, Start date, Final due, and the Comment window with `j`/`k`, then press
 `Enter` or `e` to change the selected value. The Comment window is a multiline editor: use
 `Enter` for a new line, `Ctrl+S` to save, and `Esc` to cancel. Enter `-` on Final goal or Final
-due to clear it. `Esc` returns to Goals.
+due to clear it. Changing Daily goal takes effect today and preserves the target and expected
+cumulative pace shown on earlier dates. `Esc` returns to Goals.
 
 Gantt combines project planning ranges and goal runtimes on one timeline. Use `w`, `m`,
 or `y` for week, month, or year scale; `h`/`l` moves between periods and `g` returns to

@@ -157,9 +157,54 @@ const planner::Session* session_by_id(const planner::State& state, int id) {
     return found == state.sessions.end() ? nullptr : &*found;
 }
 
+struct SharedBoundary {
+    const planner::Session* left{};
+    const planner::Session* right{};
+};
+
+std::vector<SharedBoundary> shared_boundaries(const planner::State& state, const planner::Session& selected) {
+    std::vector<SharedBoundary> result;
+    for (const auto& other : state.sessions) {
+        if (other.id == selected.id) continue;
+        if (other.ended_at && *other.ended_at == selected.started_at)
+            result.push_back({&other, &selected});
+        if (selected.ended_at && *selected.ended_at == other.started_at)
+            result.push_back({&selected, &other});
+    }
+    return result;
+}
+
+int tracker_row_for_session(const planner::State& state, int session_id) {
+    const auto [day_start, day_end] = local_day_bounds(state.tracker_date);
+    int row = 0;
+    for (const auto& session : state.sessions) {
+        const auto end = session.ended_at.value_or(state.now);
+        if (session.started_at >= day_end || end <= day_start) continue;
+        if (session.id == session_id) return row;
+        ++row;
+    }
+    return std::max(0, row - 1);
+}
+
+bool valid_tracker_boundary(const planner::State& state, planner::TimePoint boundary) {
+    if (!state.boundary_left_session_id || !state.boundary_right_session_id) return false;
+    const auto* left = session_by_id(state, *state.boundary_left_session_id);
+    const auto* right = session_by_id(state, *state.boundary_right_session_id);
+    return left && right && left->ended_at && *left->ended_at == right->started_at &&
+           boundary > left->started_at && (!right->ended_at || boundary < *right->ended_at) &&
+           (right->ended_at || boundary <= state.now);
+}
+
 std::vector<const planner::Task*> picker_tasks(const planner::State& state) {
     std::vector<const planner::Task*> tasks;
-    for (const auto& task : state.tasks) if (!task.archived) tasks.push_back(&task);
+    for (const auto& task : state.tasks) {
+        const auto project = std::find_if(state.projects.begin(), state.projects.end(), [&task](const auto& item) {
+            return item.id == task.project_id;
+        });
+        if (!task.archived && planner::activity_matches_query(
+                task, project == state.projects.end() ? nullptr : &*project, state.task_picker_query))
+            tasks.push_back(&task);
+    }
     std::sort(tasks.begin(), tasks.end(), [&state](const auto* left, const auto* right) {
         auto project_order = [&state](int id) {
             const auto found = std::find_if(state.projects.begin(), state.projects.end(), [id](const auto& project) {
@@ -224,8 +269,9 @@ int due_todo_count(const planner::State& state) {
         [&date](const auto& task) { return !task.archived && task.due_date == date; }));
 }
 
-bool goal_active_on(const planner::Goal& goal, const std::string& date) {
-    return goal.start_date <= date && (goal.target_date.empty() || date <= goal.target_date);
+bool goal_active_on(const planner::State& state, const planner::Goal& goal, const std::string& date) {
+    return goal.start_date <= date && (goal.target_date.empty() || date <= goal.target_date) &&
+           !planner::goal_complete_on(state, goal, date);
 }
 
 double selected_goal_net(const planner::State& state) {
@@ -233,20 +279,30 @@ double selected_goal_net(const planner::State& state) {
     const auto& goal = state.goals[std::clamp(state.goal_row, 0, static_cast<int>(state.goals.size()) - 1)];
     double total = 0;
     for (const auto& entry : state.goal_entries) if (entry.goal_id == goal.id) total += entry.amount;
-    long long elapsed = 1;
-    try {
-        elapsed = std::max<long long>(1, std::chrono::duration_cast<std::chrono::hours>(
-            planner::parse_time(planner::date_iso(state.now) + "T12:00:00") -
-            planner::parse_time(goal.start_date + "T12:00:00")).count() / 24 + 1);
-    } catch (const std::exception&) {}
-    const double expected = goal.target > 0 ? std::min(goal.target, goal.daily_goal * elapsed) :
-                                              goal.daily_goal * elapsed;
+    const double scheduled = planner::goal_expected_on(state, goal, planner::date_iso(state.now));
+    const double expected = goal.target > 0 ? std::min(goal.target, scheduled) : scheduled;
     return total - expected;
 }
 
 int goal_net_y(const planner::State& state, int height) {
     const int shown = std::min(static_cast<int>(state.goals.size()), std::max(0, height - 16));
     return std::max(7 + shown, height - 10) + 3;
+}
+
+const planner::Goal* editing_goal(const planner::State& state) {
+    const auto found = std::find_if(state.goals.begin(), state.goals.end(), [&state](const auto& goal) {
+        return state.editing_goal_id && goal.id == *state.editing_goal_id;
+    });
+    return found == state.goals.end() ? nullptr : &*found;
+}
+
+int goal_comment_row(const planner::State& state) {
+    const auto* goal = editing_goal(state);
+    return goal && goal->book_mode ? 7 : 6;
+}
+
+int goal_comment_y(const planner::State& state) {
+    return goal_comment_row(state) == 7 ? 13 : 12;
 }
 
 planner::Goal* selected_daily_goal(planner::State& state) {
@@ -256,7 +312,7 @@ planner::Goal* selected_daily_goal(planner::State& state) {
     const std::string date = planner::date_iso(state.todo_date);
     int index = 0;
     for (auto& goal : state.goals)
-        if (goal_active_on(goal, date) && index++ == wanted) return &goal;
+        if (goal_active_on(state, goal, date) && index++ == wanted) return &goal;
     return nullptr;
 }
 
@@ -266,7 +322,7 @@ int todo_count(const planner::State& state) {
         const std::string date = planner::date_iso(state.todo_date);
         count += due_todo_count(state);
         count += static_cast<int>(std::count_if(state.goals.begin(), state.goals.end(),
-            [&date](const auto& goal) { return goal_active_on(goal, date); }));
+            [&state, &date](const auto& goal) { return goal_active_on(state, goal, date); }));
     }
     return count;
 }
@@ -491,6 +547,63 @@ std::string local_hhmmss(planner::TimePoint point) {
     return result;
 }
 
+planner::TimePoint tracker_cursor_time(const planner::State& state) {
+    const int minutes = std::clamp(state.tracker_cursor_minutes, 0, 1439);
+    const std::string time = (minutes / 60 < 10 ? "0" : "") + std::to_string(minutes / 60) + ":" +
+                             (minutes % 60 < 10 ? "0" : "") + std::to_string(minutes % 60);
+    return planner::parse_time(planner::date_iso(state.tracker_date) + "T" + time + ":00");
+}
+
+void focus_tracker_timeline(planner::State& state) {
+    const auto [day_start, day_end] = local_day_bounds(state.tracker_date);
+    planner::TimePoint anchor = day_start + (day_end - day_start) / 2;
+    if (const auto* session = selected_tracker_session(state)) {
+        const auto start = std::max(session->started_at, day_start);
+        const auto end = std::min(session->ended_at.value_or(state.now), day_end);
+        anchor = start + (end - start) / 2;
+    } else if (state.now >= day_start && state.now < day_end) {
+        anchor = state.now;
+    }
+    const std::time_t value = planner::Clock::to_time_t(anchor);
+    std::tm tm{};
+    localtime_r(&value, &tm);
+    const int minutes = tm.tm_hour * 60 + tm.tm_min;
+    state.tracker_cursor_minutes = std::clamp(((minutes + 7) / 15) * 15, 0, 1439);
+    state.tracker_timeline_focused = true;
+}
+
+const planner::Session* tracker_session_at_cursor(const planner::State& state, bool strictly_inside) {
+    const auto cursor = tracker_cursor_time(state);
+    for (const auto& session : state.sessions) {
+        const auto end = session.ended_at.value_or(state.now);
+        if (strictly_inside ? cursor > session.started_at && cursor < end :
+                              cursor >= session.started_at && cursor < end)
+            return &session;
+    }
+    return nullptr;
+}
+
+std::optional<SharedBoundary> tracker_boundary_at_cursor(const planner::State& state) {
+    const auto cursor = tracker_cursor_time(state);
+    std::optional<SharedBoundary> best;
+    long long best_distance = 0;
+    for (const auto& left : state.sessions) {
+        if (!left.ended_at) continue;
+        for (const auto& right : state.sessions) {
+            if (left.id == right.id || right.started_at != *left.ended_at) continue;
+            const auto right_end = right.ended_at.value_or(state.now);
+            if (cursor <= left.started_at || cursor >= right_end || (!right.ended_at && cursor > state.now)) continue;
+            const long long distance = std::llabs(std::chrono::duration_cast<std::chrono::seconds>(
+                cursor - *left.ended_at).count());
+            if (!best || distance < best_distance) {
+                best = SharedBoundary{&left, &right};
+                best_distance = distance;
+            }
+        }
+    }
+    return best;
+}
+
 void refresh_state(planner::State& state, planner::Store& store, planner::TimePoint now) {
     const int project = state.project_index, column = state.column, row = state.row;
     const auto view = state.view;
@@ -500,9 +613,18 @@ void refresh_state(planner::State& state, planner::Store& store, planner::TimePo
     const bool project_focused = state.project_focused;
     const bool all_projects = state.all_projects;
     const int tracker_row = state.tracker_row;
+    const bool tracker_timeline_focused = state.tracker_timeline_focused;
+    const int tracker_cursor_minutes = state.tracker_cursor_minutes;
+    const bool tracker_boundary_dragging = state.tracker_boundary_dragging;
     const int session_edit_row = state.session_edit_row;
     const int task_picker_row = state.task_picker_row;
+    const std::string task_picker_query = state.task_picker_query;
+    const bool task_picker_search_focused = state.task_picker_search_focused;
     const auto editing_session_id = state.editing_session_id;
+    const bool session_picker_returns_tracker = state.session_picker_returns_tracker;
+    const auto boundary_left_session_id = state.boundary_left_session_id;
+    const auto boundary_right_session_id = state.boundary_right_session_id;
+    const auto tracker_boundary = state.tracker_boundary;
     const auto tracker_date = state.tracker_date;
     const bool calendar_selecting_tracker = state.calendar_selecting_tracker;
     const bool calendar_selecting_task_due = state.calendar_selecting_task_due;
@@ -541,9 +663,18 @@ void refresh_state(planner::State& state, planner::Store& store, planner::TimePo
     state.project_focused = project_focused;
     state.all_projects = all_projects;
     state.tracker_row = tracker_row;
+    state.tracker_timeline_focused = tracker_timeline_focused;
+    state.tracker_cursor_minutes = tracker_cursor_minutes;
+    state.tracker_boundary_dragging = tracker_boundary_dragging;
     state.session_edit_row = session_edit_row;
     state.task_picker_row = task_picker_row;
+    state.task_picker_query = task_picker_query;
+    state.task_picker_search_focused = task_picker_search_focused;
     state.editing_session_id = editing_session_id;
+    state.session_picker_returns_tracker = session_picker_returns_tracker;
+    state.boundary_left_session_id = boundary_left_session_id;
+    state.boundary_right_session_id = boundary_right_session_id;
+    state.tracker_boundary = tracker_boundary;
     state.tracker_date = tracker_date;
     state.calendar_selecting_tracker = calendar_selecting_tracker;
     state.calendar_selecting_task_due = calendar_selecting_task_due;
@@ -574,6 +705,36 @@ void refresh_state(planner::State& state, planner::Store& store, planner::TimePo
     normalize(state);
 }
 
+void split_tracker_session(planner::State& state, planner::Store& store,
+                           const planner::Session& session, planner::TimePoint split_at) {
+    const auto interval_end = session.ended_at.value_or(state.now);
+    if (split_at <= session.started_at || split_at >= interval_end ||
+        (!session.ended_at && split_at > state.now))
+        throw std::invalid_argument("split outside interval");
+    const int task_id = session.task_id;
+    store.checkpoint();
+    const int second_id = store.split_session(session.id, split_at, task_id);
+    refresh_state(state, store, state.now);
+    state.tracker_row = tracker_row_for_session(state, second_id);
+    state.editing_session_id = second_id;
+    state.session_picker_returns_tracker = true;
+    state.task_picker_query.clear();
+    state.task_picker_search_focused = true;
+    const auto tasks = picker_tasks(state);
+    const auto current = std::find_if(tasks.begin(), tasks.end(), [task_id](const auto* task) {
+        return task->id == task_id;
+    });
+    state.task_picker_row = current == tasks.end() ? 0 : static_cast<int>(current - tasks.begin());
+    if (tasks.empty()) {
+        state.editing_session_id.reset();
+        state.session_picker_returns_tracker = false;
+        state.message = "Interval split; no available activity can be assigned.";
+    } else {
+        state.view = planner::View::SessionTaskPicker;
+        state.message = "Interval split; choose the activity for the second half.";
+    }
+}
+
 void color_range(int y, int x, int length, int pair, int attributes = A_BOLD) {
     if (y < 0 || y >= LINES || x >= COLS || length <= 0) return;
     x = std::max(0, x);
@@ -601,6 +762,17 @@ void paint_tracker_timeline(const planner::State& state, int origin_x, int width
     const int bar_x = origin_x + 3, bar_width = std::max(8, width - 6);
     const bool show_focus = origin_x == 0;
     const int bar_y = show_focus ? height - 8 : height - 4;
+    auto session_bounds = [&state](const planner::Session& session) {
+        auto start = session.started_at;
+        auto end = session.ended_at.value_or(state.now);
+        if (state.tracker_boundary_dragging) {
+            if (state.boundary_left_session_id && session.id == *state.boundary_left_session_id)
+                end = state.tracker_boundary;
+            if (state.boundary_right_session_id && session.id == *state.boundary_right_session_id)
+                start = state.tracker_boundary;
+        }
+        return std::pair{start, end};
+    };
     auto paint_segment = [&](planner::TimePoint raw_start, planner::TimePoint raw_end, int pair) {
         if (raw_start >= day_end || raw_end <= day_start) return;
         const auto start = std::max(raw_start, day_start), end = std::min(raw_end, day_end);
@@ -613,16 +785,16 @@ void paint_tracker_timeline(const planner::State& state, int origin_x, int width
     int y = 5;
     const int limit = std::max(6, bar_y - 5);
     for (const auto& session : state.sessions) {
-        const auto end = session.ended_at.value_or(state.now);
-        if (session.started_at >= day_end || end <= day_start) continue;
+        const auto [start, end] = session_bounds(session);
+        if (start >= day_end || end <= day_start) continue;
         const auto task = std::find_if(state.tasks.begin(), state.tasks.end(), [&session](const auto& item) {
             return item.id == session.task_id;
         });
         const std::string name = task == state.tasks.end() ? "Unknown task" : task->title;
         const int pair = activity_color_pair(session.task_id, false, name);
-        paint_segment(session.started_at, end, pair);
+        paint_segment(start, end, pair);
         if (y < limit) {
-            const bool selected = y == 5 + state.tracker_row;
+            const bool selected = !state.tracker_timeline_focused && y == 5 + state.tracker_row;
             color_range(y, origin_x + 2, width - 4, pair, A_BOLD | (selected ? A_REVERSE : 0));
             ++y;
         }
@@ -663,6 +835,57 @@ void paint_tracker_timeline(const planner::State& state, int origin_x, int width
         });
         label(session.allowance_id, true, allowance == state.allowances.end() ? "Allowance" : allowance->name,
               activity_color_pair(session.allowance_id, true));
+    }
+    struct ActivityMark {
+        int id{};
+        bool allowance{};
+        planner::TimePoint first{};
+        int preferred{};
+        int pair{};
+    };
+    std::vector<ActivityMark> marks;
+    auto add_mark = [&](int id, bool allowance, planner::TimePoint raw_start,
+                        planner::TimePoint raw_end, int pair) {
+        if (raw_start >= day_end || raw_end <= day_start) return;
+        if (std::any_of(marks.begin(), marks.end(), [id, allowance](const auto& mark) {
+                return mark.id == id && mark.allowance == allowance;
+            })) return;
+        const auto start = std::max(raw_start, day_start);
+        const auto end = std::min(raw_end, day_end);
+        const auto middle = start + (end - start) / 2;
+        const auto from = std::chrono::duration_cast<std::chrono::seconds>(middle - day_start).count();
+        marks.push_back({id, allowance, start,
+            std::clamp(static_cast<int>(from * std::max(0, bar_width - 1) / day_seconds),
+                       0, std::max(0, bar_width - 1)), pair});
+    };
+    for (const auto& session : state.sessions) {
+        const auto [start, end] = session_bounds(session);
+        const auto task = std::find_if(state.tasks.begin(), state.tasks.end(), [&session](const auto& item) {
+            return item.id == session.task_id;
+        });
+        const std::string name = task == state.tasks.end() ? "Unknown task" : task->title;
+        add_mark(session.task_id, false, start, end, activity_color_pair(session.task_id, false, name));
+    }
+    for (const auto& session : state.allowance_sessions)
+        add_mark(session.allowance_id, true, session.started_at, session.ended_at.value_or(state.now),
+                 activity_color_pair(session.allowance_id, true));
+    std::sort(marks.begin(), marks.end(), [](const auto& left, const auto& right) {
+        return std::tuple{left.preferred, left.first, left.allowance, left.id} <
+               std::tuple{right.preferred, right.first, right.allowance, right.id};
+    });
+    std::vector<int> preferred;
+    for (const auto& mark : marks) preferred.push_back(mark.preferred);
+    const auto positions = planner::spread_timeline_marks(preferred, bar_width);
+    for (int i = 0; i < static_cast<int>(positions.size()); ++i)
+        color_range(bar_y, bar_x + positions[i], 1, marks[i].pair, A_BOLD);
+    if (state.tracker_timeline_focused) {
+        const int cursor_x = std::clamp(state.tracker_cursor_minutes * std::max(0, bar_width - 1) / 1439,
+                                        0, std::max(0, bar_width - 1));
+        int cursor_pair = 13;
+        for (int i = 0; i < static_cast<int>(positions.size()); ++i)
+            if (positions[i] == cursor_x) cursor_pair = marks[i].pair;
+        color_range(bar_y, bar_x + cursor_x, 1, cursor_pair,
+                    cursor_pair == 13 ? A_BOLD : A_BOLD | A_REVERSE);
     }
 }
 
@@ -718,7 +941,8 @@ void paint_colors(const planner::State& state, int width, int height) {
             }
         } else if (state.view == planner::View::EditGoal) {
             color_range(2, rail + 2, width - rail - 4, 3);
-            const int selected_y = state.goal_edit_row == 6 ? 12 : 5 + state.goal_edit_row;
+            const int selected_y = state.goal_edit_row == goal_comment_row(state) ?
+                goal_comment_y(state) : 5 + state.goal_edit_row;
             color_range(selected_y, rail + 2, width - rail - 4, 3, A_BOLD | A_REVERSE);
         } else if (state.view == planner::View::Tracker || state.view == planner::View::Allowances) {
             color_range(2, rail + 2, width - rail - 4, 3);
@@ -803,7 +1027,8 @@ void paint_colors(const planner::State& state, int width, int height) {
     }
     if (state.view == planner::View::EditGoal) {
         color_range(2, 1, width - 2, 3);
-        const int selected_y = state.goal_edit_row == 6 ? 12 : 5 + state.goal_edit_row;
+        const int selected_y = state.goal_edit_row == goal_comment_row(state) ?
+            goal_comment_y(state) : 5 + state.goal_edit_row;
         color_range(selected_y, 2, width - 4, 3, A_BOLD | A_REVERSE);
         return;
     }
@@ -933,7 +1158,27 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
         const int key = getch();
         state.message.clear();
         if (key == ERR) continue;
-        if (key == 'q') running = false;
+        if (state.view == planner::View::SessionTaskPicker && state.task_picker_search_focused &&
+            (key == '\n' || key == KEY_ENTER)) {
+            const auto tasks = picker_tasks(state);
+            if (tasks.empty()) state.message = "No activities match that search.";
+            else {
+                state.task_picker_search_focused = false;
+                state.task_picker_row = std::clamp(state.task_picker_row, 0,
+                                                    static_cast<int>(tasks.size()) - 1);
+            }
+        }
+        else if (state.view == planner::View::SessionTaskPicker && state.task_picker_search_focused &&
+                 (key == KEY_BACKSPACE || key == 127 || key == 8)) {
+            if (!state.task_picker_query.empty()) state.task_picker_query.pop_back();
+            state.task_picker_row = 0;
+        }
+        else if (state.view == planner::View::SessionTaskPicker && state.task_picker_search_focused &&
+                 key >= 32 && key <= 126) {
+            state.task_picker_query.push_back(static_cast<char>(key));
+            state.task_picker_row = 0;
+        }
+        else if (key == 'q') running = false;
         else if (key == 26) {
             if (store.undo()) { refresh_state(state, store, state.now); state.message = "Last action undone."; }
             else state.message = "Nothing to undo.";
@@ -964,6 +1209,7 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
                  (key == '\n' || key == KEY_ENTER)) {
             state.tracker_date = state.calendar_date;
             state.tracker_row = -1;
+            state.tracker_timeline_focused = false;
             state.calendar_selecting_tracker = false;
             state.view = planner::View::Tracker;
             state.message = "Tracker date selected.";
@@ -1152,30 +1398,198 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
             }
             state.project_focused = false; state.row = 0;
         }
-        else if (state.view == planner::View::Tracker && (key == 'k' || key == KEY_UP))
+        else if (state.view == planner::View::Tracker && state.tracker_timeline_focused &&
+                 (key == 'k' || key == KEY_UP)) {
+            if (state.tracker_boundary_dragging)
+                state.message = "Save or cancel the boundary drag first.";
+            else {
+                state.tracker_timeline_focused = false;
+                state.tracker_row = today_session_count(state) > 0 ? today_session_count(state) - 1 : -1;
+            }
+        }
+        else if (state.view == planner::View::Tracker && !state.tracker_timeline_focused &&
+                 (key == 'k' || key == KEY_UP))
             state.tracker_row = std::max(-1, state.tracker_row - 1);
-        else if (state.view == planner::View::Tracker && (key == 'j' || key == KEY_DOWN))
-            state.tracker_row = std::min(std::max(0, today_session_count(state) - 1), state.tracker_row + 1);
-        else if (state.view == planner::View::Tracker && state.tracker_row < 0 &&
+        else if (state.view == planner::View::Tracker && !state.tracker_timeline_focused &&
+                 (key == 'j' || key == KEY_DOWN)) {
+            const int count = today_session_count(state);
+            if (count == 0 || state.tracker_row >= count - 1) focus_tracker_timeline(state);
+            else ++state.tracker_row;
+        }
+        else if (state.view == planner::View::Tracker && state.tracker_timeline_focused &&
+                 (key == 'h' || key == KEY_LEFT || key == 'l' || key == KEY_RIGHT ||
+                  key == 'H' || key == 'L' || key == '[' || key == ']')) {
+            const int direction = key == 'h' || key == KEY_LEFT || key == 'H' || key == '[' ? -1 : 1;
+            const int step = key == '[' || key == ']' ? 5 : key == 'H' || key == 'L' ? 60 : 15;
+            const int previous = state.tracker_cursor_minutes;
+            state.tracker_cursor_minutes = std::clamp(previous + direction * step, 0, 1439);
+            if (state.tracker_boundary_dragging) {
+                const auto boundary = tracker_cursor_time(state);
+                if (valid_tracker_boundary(state, boundary)) state.tracker_boundary = boundary;
+                else {
+                    state.tracker_cursor_minutes = previous;
+                    state.message = "Boundary cannot cross either adjacent interval endpoint.";
+                }
+            }
+        }
+        else if (state.view == planner::View::Tracker && state.tracker_boundary_dragging &&
+                 (key == '\n' || key == KEY_ENTER)) {
+            if (valid_tracker_boundary(state, state.tracker_boundary)) {
+                const int left_id = *state.boundary_left_session_id;
+                const int right_id = *state.boundary_right_session_id;
+                try {
+                    store.checkpoint();
+                    store.move_session_boundary(left_id, right_id, state.tracker_boundary);
+                    state.tracker_boundary_dragging = false;
+                    refresh_state(state, store, state.now);
+                    state.tracker_row = tracker_row_for_session(state, right_id);
+                    state.boundary_left_session_id.reset();
+                    state.boundary_right_session_id.reset();
+                    state.message = "Shared boundary moved on the timeline; total tracked time is unchanged.";
+                } catch (const std::exception&) {
+                    state.message = "Boundary could not be moved; the intervals may have changed.";
+                }
+            } else state.message = "Boundary cannot cross either adjacent interval endpoint.";
+        }
+        else if (state.view == planner::View::Tracker && !state.tracker_timeline_focused && state.tracker_row < 0 &&
                  (key == 'h' || key == KEY_LEFT))
             state.tracker_date = shift_local_days(state.tracker_date, -1);
-        else if (state.view == planner::View::Tracker && state.tracker_row < 0 &&
+        else if (state.view == planner::View::Tracker && !state.tracker_timeline_focused && state.tracker_row < 0 &&
                  (key == 'l' || key == KEY_RIGHT))
             state.tracker_date = shift_local_days(state.tracker_date, 1);
-        else if (state.view == planner::View::Tracker && state.tracker_row < 0 && key == 'g')
+        else if (state.view == planner::View::Tracker && !state.tracker_timeline_focused &&
+                 state.tracker_row < 0 && key == 'g')
             state.tracker_date = state.now;
-        else if (state.view == planner::View::Tracker && state.tracker_row < 0 &&
+        else if (state.view == planner::View::Tracker && !state.tracker_timeline_focused && state.tracker_row < 0 &&
                  (key == '\n' || key == KEY_ENTER)) {
             state.calendar_date = state.tracker_date;
             state.calendar_selecting_tracker = true;
             state.view = planner::View::Calendar;
         }
         else if (state.view == planner::View::Tracker && key == 'e') {
-            if (const auto* session = selected_tracker_session(state)) {
+            if (state.tracker_boundary_dragging) {
+                state.message = "Save or cancel the boundary drag before editing an activity.";
+                continue;
+            }
+            const auto* session = state.tracker_timeline_focused ?
+                tracker_session_at_cursor(state, false) : selected_tracker_session(state);
+            if (session) {
+                state.tracker_row = tracker_row_for_session(state, session->id);
                 state.editing_session_id = session->id;
+                state.session_picker_returns_tracker = false;
                 state.session_edit_row = 0;
                 state.view = planner::View::EditSession;
+            } else state.message = "No tracked activity at the selected time.";
+        }
+        else if (state.view == planner::View::Tracker && key == 'x') {
+            if (state.tracker_boundary_dragging) {
+                state.message = "Save or cancel the boundary drag before splitting.";
+            } else if (state.tracker_timeline_focused) {
+                if (const auto* session = tracker_session_at_cursor(state, true)) {
+                    try {
+                        split_tracker_session(state, store, *session, tracker_cursor_time(state));
+                    } catch (const std::exception&) {
+                        state.message = "Invalid split; the marker must be strictly inside an interval.";
+                    }
+                } else state.message = "Move the marker inside a tracked interval before splitting.";
+            } else if (const auto* session = selected_tracker_session(state)) {
+                const auto interval_end = session->ended_at.value_or(state.now);
+                const auto midpoint = session->started_at + (interval_end - session->started_at) / 2;
+                const std::string tracker_date = planner::date_iso(state.tracker_date);
+                const std::string default_time = local_hhmmss(midpoint).substr(0, 5);
+                const auto entered_date = prompt("Split date [" + tracker_date + "]: ", height);
+                const auto entered_time = prompt("Split time [" + default_time + "]: ", height);
+                try {
+                    split_tracker_session(state, store, *session, planner::resolve_split_time(
+                        midpoint, state.tracker_date, entered_date, entered_time));
+                } catch (const std::exception&) {
+                    state.message = "Invalid split; choose a time strictly inside the interval.";
+                }
+            } else state.message = "Select a tracked interval before splitting it.";
+        }
+        else if (state.view == planner::View::Tracker && key == 'b') {
+            if (state.tracker_boundary_dragging) {
+                state.message = "Boundary drag is active; press Enter to save or Esc to cancel.";
+            } else if (state.tracker_timeline_focused) {
+                const auto boundary = tracker_boundary_at_cursor(state);
+                if (!boundary) {
+                    state.message = "No shared task boundary can move to the selected time.";
+                } else {
+                    state.boundary_left_session_id = boundary->left->id;
+                    state.boundary_right_session_id = boundary->right->id;
+                    state.tracker_boundary = tracker_cursor_time(state);
+                    state.tracker_boundary_dragging = true;
+                    state.message = "Dragging shared boundary on timeline; Enter saves and Esc cancels.";
+                }
+            } else if (const auto* session = selected_tracker_session(state)) {
+                const auto boundaries = shared_boundaries(state, *session);
+                if (boundaries.empty()) {
+                    state.message = "No shared boundary; the neighbouring intervals have a gap or overlap.";
+                } else {
+                    const SharedBoundary* chosen = &boundaries.front();
+                    if (boundaries.size() > 1) {
+                        const auto side = prompt("Move [s]tart or [e]nd boundary: ", height);
+                        const bool want_start = !side.empty() && (side[0] == 's' || side[0] == 'S');
+                        const auto found = std::find_if(boundaries.begin(), boundaries.end(),
+                            [session, want_start](const auto& boundary) {
+                                return want_start ? boundary.right->id == session->id :
+                                                    boundary.left->id == session->id;
+                            });
+                        if (found == boundaries.end()) {
+                            state.message = "Boundary selection cancelled.";
+                            continue;
+                        }
+                        chosen = &*found;
+                    }
+                    state.boundary_left_session_id = chosen->left->id;
+                    state.boundary_right_session_id = chosen->right->id;
+                    state.tracker_boundary = *chosen->left->ended_at;
+                    state.view = planner::View::TrackerBoundary;
+                }
+            } else state.message = "Select a tracked interval before moving a boundary.";
+        }
+        else if (state.view == planner::View::TrackerBoundary &&
+                 (key == 'h' || key == KEY_LEFT || key == 'l' || key == KEY_RIGHT ||
+                  key == 'H' || key == 'L')) {
+            const int direction = key == 'h' || key == KEY_LEFT || key == 'H' ? -1 : 1;
+            const int minutes = key == 'H' || key == 'L' ? 15 : 5;
+            const auto changed = state.tracker_boundary + std::chrono::minutes(direction * minutes);
+            if (valid_tracker_boundary(state, changed)) state.tracker_boundary = changed;
+            else state.message = "Boundary cannot cross either interval endpoint.";
+        }
+        else if (state.view == planner::View::TrackerBoundary && key == 'e') {
+            const std::string current_date = planner::date_iso(state.tracker_boundary);
+            const std::string current_time = local_hhmmss(state.tracker_boundary).substr(0, 5);
+            const auto entered_date = prompt("Boundary date [" + current_date + "]: ", height);
+            const auto entered_time = prompt("Boundary time [" + current_time + "]: ", height);
+            try {
+                const auto changed = entered_date.empty() && entered_time.empty() ? state.tracker_boundary :
+                    planner::parse_time((entered_date.empty() ? current_date : entered_date) + "T" +
+                        (entered_time.empty() ? current_time : entered_time) + ":00");
+                if (!valid_tracker_boundary(state, changed)) throw std::invalid_argument("invalid boundary");
+                state.tracker_boundary = changed;
+                state.message = "Boundary preview updated; press Enter to save.";
+            } catch (const std::exception&) {
+                state.message = "Invalid boundary; it must stay inside both intervals.";
             }
+        }
+        else if (state.view == planner::View::TrackerBoundary &&
+                 (key == '\n' || key == KEY_ENTER)) {
+            if (valid_tracker_boundary(state, state.tracker_boundary)) {
+                const int left_id = *state.boundary_left_session_id;
+                const int right_id = *state.boundary_right_session_id;
+                try {
+                    store.checkpoint();
+                    store.move_session_boundary(left_id, right_id, state.tracker_boundary);
+                    state.view = planner::View::Tracker;
+                    refresh_state(state, store, state.now);
+                    state.tracker_row = tracker_row_for_session(state, right_id);
+                    state.boundary_left_session_id.reset(); state.boundary_right_session_id.reset();
+                    state.message = "Shared boundary moved; total tracked time is unchanged.";
+                } catch (const std::exception&) {
+                    state.message = "Boundary could not be moved; the intervals may have changed.";
+                }
+            } else state.message = "Boundary cannot cross either interval endpoint.";
         }
         else if (state.view == planner::View::EditSession && (key == 'k' || key == KEY_UP))
             state.session_edit_row = std::max(0, state.session_edit_row - 1);
@@ -1185,6 +1599,8 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
             const auto* session = state.editing_session_id ? session_by_id(state, *state.editing_session_id) : nullptr;
             if (!session) state.message = "Tracked interval is unavailable.";
             else if (state.session_edit_row == 0) {
+                state.task_picker_query.clear();
+                state.task_picker_search_focused = true;
                 const auto tasks = picker_tasks(state);
                 state.task_picker_row = 0;
                 const auto current = std::find_if(tasks.begin(), tasks.end(), [session](const auto* task) {
@@ -1229,19 +1645,35 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
                 }
             }
         }
-        else if (state.view == planner::View::SessionTaskPicker && (key == 'k' || key == KEY_UP))
+        else if (state.view == planner::View::SessionTaskPicker && !state.task_picker_search_focused && key == '/')
+            state.task_picker_search_focused = true;
+        else if (state.view == planner::View::SessionTaskPicker && !state.task_picker_search_focused &&
+                 (key == 'k' || key == KEY_UP))
             state.task_picker_row = std::max(0, state.task_picker_row - 1);
-        else if (state.view == planner::View::SessionTaskPicker && (key == 'j' || key == KEY_DOWN))
+        else if (state.view == planner::View::SessionTaskPicker && !state.task_picker_search_focused &&
+                 (key == 'j' || key == KEY_DOWN))
             state.task_picker_row = std::min(std::max(0, static_cast<int>(picker_tasks(state).size()) - 1),
                                              state.task_picker_row + 1);
-        else if (state.view == planner::View::SessionTaskPicker && (key == '\n' || key == KEY_ENTER)) {
+        else if (state.view == planner::View::SessionTaskPicker && !state.task_picker_search_focused &&
+                 (key == '\n' || key == KEY_ENTER)) {
             const auto tasks = picker_tasks(state);
             if (state.editing_session_id && !tasks.empty()) {
                 const auto* task = tasks[std::clamp(state.task_picker_row, 0, static_cast<int>(tasks.size()) - 1)];
                 const std::string task_title = task->title;
-                store.checkpoint(); store.update_session_task(*state.editing_session_id, task->id);
-                refresh_state(state, store, state.now); state.view = planner::View::EditSession;
-                state.message = "Tracked interval moved to " + task_title + ".";
+                const int session_id = *state.editing_session_id;
+                const bool return_to_tracker = state.session_picker_returns_tracker;
+                if (!return_to_tracker) store.checkpoint();
+                store.update_session_task(session_id, task->id);
+                refresh_state(state, store, state.now);
+                if (return_to_tracker) {
+                    state.view = planner::View::Tracker;
+                    state.tracker_row = tracker_row_for_session(state, session_id);
+                    state.editing_session_id.reset(); state.session_picker_returns_tracker = false;
+                    state.message = "Interval split; second half assigned to " + task_title + ".";
+                } else {
+                    state.view = planner::View::EditSession;
+                    state.message = "Tracked interval moved to " + task_title + ".";
+                }
             }
         }
         else if (state.view == planner::View::Tracker && key == 'n') {
@@ -1378,6 +1810,37 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
             state.goal_row = std::max(0, state.goal_row - 1);
         else if (state.view == planner::View::Goals && (key == 'j' || key == KEY_DOWN))
             state.goal_row = std::min(std::max(0, static_cast<int>(state.goals.size()) - 1), state.goal_row + 1);
+        else if (state.view == planner::View::Goals && (key == 'r' || key == 'b')) {
+            const auto title = prompt("Reading title: ", height);
+            const auto starting = prompt("Starting page: ", height);
+            const auto ending = prompt("End page: ", height);
+            const auto current = prompt("Current page: ", height);
+            const auto daily = prompt("Daily page goal: ", height);
+            const auto deadline = prompt("Finish date (optional YYYY-MM-DD): ", height);
+            try {
+                const double start_page = std::stod(starting);
+                const double end_page = std::stod(ending);
+                const double current_page = std::stod(current);
+                const double daily_pages = std::stod(daily);
+                if (!deadline.empty()) planner::parse_time(deadline + "T12:00:00");
+                if (title.empty() || !std::isfinite(start_page) || !std::isfinite(end_page) ||
+                    !std::isfinite(current_page) || !std::isfinite(daily_pages) || daily_pages <= 0 ||
+                    start_page < 0 || end_page <= start_page ||
+                    current_page < start_page || current_page > end_page ||
+                    (!deadline.empty() && deadline < planner::date_iso(state.now)))
+                    throw std::invalid_argument("invalid book goal");
+                store.checkpoint();
+                const int id = store.add_goal(title, "pages", end_page - start_page,
+                    planner::date_iso(state.now), deadline, daily_pages, {}, true, start_page, end_page);
+                if (current_page != start_page)
+                    store.add_goal_entry(id, planner::date_iso(state.now), current_page - start_page,
+                                         "Initial current page");
+                refresh_state(state, store, state.now); state.goal_row = static_cast<int>(state.goals.size()) - 1;
+                state.message = "Reading goal created and added to Daily Todos.";
+            } catch (const std::exception&) {
+                state.message = "Invalid reading goal; use start <= current <= end and a positive daily target.";
+            }
+        }
         else if (state.view == planner::View::Goals && key == 'n') {
             const auto title = prompt("Goal name: ", height);
             const auto unit = prompt("Unit (for example pages): ", height);
@@ -1408,7 +1871,7 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
         else if (state.view == planner::View::EditGoal && (key == 'k' || key == KEY_UP))
             state.goal_edit_row = std::max(0, state.goal_edit_row - 1);
         else if (state.view == planner::View::EditGoal && (key == 'j' || key == KEY_DOWN))
-            state.goal_edit_row = std::min(6, state.goal_edit_row + 1);
+            state.goal_edit_row = std::min(goal_comment_row(state), state.goal_edit_row + 1);
         else if (state.view == planner::View::EditGoal &&
                  (key == 'e' || key == '\n' || key == KEY_ENTER)) {
             const auto found = std::find_if(state.goals.begin(), state.goals.end(), [&state](const auto& goal) {
@@ -1417,54 +1880,113 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
             if (found == state.goals.end()) state.message = "Goal is unavailable.";
             else {
                 planner::Goal changed = *found;
-                if (state.goal_edit_row == 6) {
+                if (state.goal_edit_row == goal_comment_row(state)) {
                     const auto value = edit_comment(changed.comment, height, width);
                     if (value) {
                         changed.comment = *value;
-                        store.checkpoint(); store.update_goal(changed); refresh_state(state, store, state.now);
+                        store.checkpoint(); store.update_goal(changed, planner::date_iso(state.now));
+                        refresh_state(state, store, state.now);
                         state.message = "Goal comment updated.";
                     } else state.message = "Comment edit cancelled.";
                     continue;
                 }
                 std::string value;
                 if (state.goal_edit_row == 0) value = prompt("Goal name (blank keeps current): ", height);
-                else if (state.goal_edit_row == 1) value = prompt("Unit (blank keeps current): ", height);
-                else if (state.goal_edit_row == 2) value = prompt("Final goal (blank keeps, '-' clears): ", height);
-                else if (state.goal_edit_row == 3) value = prompt("Daily goal (blank keeps current): ", height);
-                else if (state.goal_edit_row == 4) value = prompt("Start date YYYY-MM-DD (blank keeps current): ", height);
+                else if (state.goal_edit_row == 1) value = prompt(changed.book_mode ?
+                    "Starting page (blank keeps current): " : "Unit (blank keeps current): ", height);
+                else if (state.goal_edit_row == 2) value = prompt(changed.book_mode ?
+                    "End page (blank keeps current): " : "Final goal (blank keeps, '-' clears): ", height);
+                else if (state.goal_edit_row == 3) value = prompt(changed.book_mode ?
+                    "Current page (blank keeps current): " : "Daily goal (blank keeps current): ", height);
+                else if (state.goal_edit_row == 4) value = prompt(changed.book_mode ?
+                    "Daily page goal (blank keeps current): " :
+                    "Start date YYYY-MM-DD (blank keeps current): ", height);
+                else if (state.goal_edit_row == 5) value = prompt(changed.book_mode ?
+                    "Start date YYYY-MM-DD (blank keeps current): " :
+                    "Final due YYYY-MM-DD (blank keeps, '-' clears): ", height);
                 else value = prompt("Final due YYYY-MM-DD (blank keeps, '-' clears): ", height);
                 if (!value.empty()) {
                     try {
-                        if (state.goal_edit_row == 0) changed.title = value;
-                        else if (state.goal_edit_row == 1) changed.unit = value;
-                        else if (state.goal_edit_row == 2) changed.target = value == "-" ? 0 : std::stod(value);
-                        else if (state.goal_edit_row == 3) changed.daily_goal = std::stod(value);
-                        else if (state.goal_edit_row == 4) {
-                            planner::parse_time(value + "T12:00:00"); changed.start_date = value;
-                        } else {
-                            if (value == "-") changed.target_date.clear();
-                            else { planner::parse_time(value + "T12:00:00"); changed.target_date = value; }
+                        const std::string today = planner::date_iso(state.now);
+                        if (changed.book_mode && state.goal_edit_row == 3) {
+                            const double current_page = std::stod(value);
+                            const double previous_page = planner::book_current_page_on(state, changed, today);
+                            if (!std::isfinite(current_page) || current_page < changed.start_page ||
+                                current_page > changed.end_page || current_page == previous_page)
+                                throw std::invalid_argument("invalid current page");
+                            store.checkpoint();
+                            store.add_goal_entry(changed.id, today, current_page - previous_page,
+                                                 "Current page updated");
+                            refresh_state(state, store, state.now);
+                            state.message = "Current page updated.";
+                            continue;
                         }
+                        if (state.goal_edit_row == 0) changed.title = value;
+                        else if (changed.book_mode) {
+                            if (state.goal_edit_row == 1) changed.start_page = std::stod(value);
+                            else if (state.goal_edit_row == 2) changed.end_page = std::stod(value);
+                            else if (state.goal_edit_row == 4) changed.daily_goal = std::stod(value);
+                            else if (state.goal_edit_row == 5) {
+                                planner::parse_time(value + "T12:00:00"); changed.start_date = value;
+                            } else {
+                                if (value == "-") changed.target_date.clear();
+                                else { planner::parse_time(value + "T12:00:00"); changed.target_date = value; }
+                            }
+                        } else {
+                            if (state.goal_edit_row == 1) changed.unit = value;
+                            else if (state.goal_edit_row == 2) changed.target = value == "-" ? 0 : std::stod(value);
+                            else if (state.goal_edit_row == 3) changed.daily_goal = std::stod(value);
+                            else if (state.goal_edit_row == 4) {
+                                planner::parse_time(value + "T12:00:00"); changed.start_date = value;
+                            } else {
+                                if (value == "-") changed.target_date.clear();
+                                else { planner::parse_time(value + "T12:00:00"); changed.target_date = value; }
+                            }
+                        }
+                        if (changed.book_mode) changed.target = changed.end_page - changed.start_page;
+                        const double current_page = changed.book_mode ?
+                            planner::book_current_page_on(state, *found, today) : 0;
                         if (changed.title.empty() || changed.unit.empty() || !std::isfinite(changed.target) ||
-                            changed.target < 0 || !std::isfinite(changed.daily_goal) || changed.daily_goal <= 0 ||
+                            changed.target < 0 || !std::isfinite(changed.daily_goal) ||
+                            changed.daily_goal <= 0 ||
+                            (changed.book_mode && (!std::isfinite(changed.start_page) ||
+                                !std::isfinite(changed.end_page) || changed.start_page < 0 ||
+                                changed.end_page <= changed.start_page || current_page < changed.start_page ||
+                                current_page > changed.end_page)) ||
                             (!changed.target_date.empty() && changed.target_date < changed.start_date))
                             throw std::invalid_argument("invalid goal");
-                        store.checkpoint(); store.update_goal(changed); refresh_state(state, store, state.now);
-                        state.message = "Goal field updated.";
+                        store.checkpoint(); store.update_goal(changed, planner::date_iso(state.now));
+                        if (changed.book_mode && state.goal_edit_row == 1 &&
+                            found->start_page != changed.start_page)
+                            store.add_goal_entry(changed.id, today, found->start_page - changed.start_page,
+                                                 "Starting page adjusted");
+                        refresh_state(state, store, state.now);
+                        state.message = changed.book_mode && state.goal_edit_row == 4 ?
+                            "Daily page goal updated from today onward." : changed.book_mode ?
+                            "Reading goal field updated." : state.goal_edit_row == 3 ?
+                            "Daily goal updated from today onward." : "Goal field updated.";
                     } catch (const std::exception&) { state.message = "Invalid value; goal was not changed."; }
                 }
             }
         }
         else if (state.view == planner::View::Goals && key == '+' && !state.goals.empty()) {
             const auto& goal = state.goals[std::clamp(state.goal_row, 0, static_cast<int>(state.goals.size()) - 1)];
-            const auto amount = prompt("Amount to add: ", height);
+            const bool book_mode = goal.book_mode;
+            const std::string date = planner::date_iso(state.now);
+            const auto amount = prompt(book_mode ? "Current page: " : "Amount to add: ", height);
             const auto note = prompt("Note (optional): ", height);
             try {
-                const double value = std::stod(amount);
-                if (!std::isfinite(value) || value == 0) throw std::invalid_argument("zero");
-                store.checkpoint(); store.add_goal_entry(goal.id, planner::date_iso(state.now), value, note);
-                refresh_state(state, store, state.now); state.message = "Goal datapoint recorded.";
-            } catch (const std::exception&) { state.message = "Invalid datapoint amount."; }
+                const double entered = std::stod(amount);
+                const double value = book_mode ?
+                    entered - planner::book_current_page_on(state, goal, date) : entered;
+                if (!std::isfinite(entered) || value == 0 || (book_mode &&
+                    (entered < goal.start_page || entered > goal.end_page)))
+                    throw std::invalid_argument("invalid progress");
+                store.checkpoint(); store.add_goal_entry(goal.id, date, value, note);
+                refresh_state(state, store, state.now); state.message = book_mode ?
+                    "Current page recorded." : "Goal datapoint recorded.";
+            } catch (const std::exception&) { state.message = book_mode ?
+                "Invalid current page." : "Invalid datapoint amount."; }
         }
         else if (state.view == planner::View::Goals && key == KEY_DC && !state.goals.empty()) {
             const auto& goal = state.goals[std::clamp(state.goal_row, 0, static_cast<int>(state.goals.size()) - 1)];
@@ -1525,14 +2047,23 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
                 refresh_state(state, store, state.now);
                 state.message = completed ? "Due task completed." : "Due task reopened in Ready.";
             } else if (auto* goal = selected_daily_goal(state)) {
-                const auto amount = prompt("Goal amount for " + planner::date_iso(state.todo_date) + ": ", height);
+                const bool book_mode = goal->book_mode;
+                const std::string date = planner::date_iso(state.todo_date);
+                const auto amount = prompt(book_mode ? "Current page for " + date + ": " :
+                    "Goal amount for " + date + ": ", height);
                 const auto note = prompt("Note (optional): ", height);
                 try {
-                    const double value = std::stod(amount);
-                    if (!std::isfinite(value) || value == 0) throw std::invalid_argument("zero");
-                    store.checkpoint(); store.add_goal_entry(goal->id, planner::date_iso(state.todo_date), value, note);
-                    refresh_state(state, store, state.now); state.message = "Goal datapoint recorded.";
-                } catch (const std::exception&) { state.message = "Invalid datapoint amount."; }
+                    const double entered = std::stod(amount);
+                    const double value = book_mode ?
+                        entered - planner::book_current_page_on(state, *goal, date) : entered;
+                    if (!std::isfinite(entered) || value == 0 || (book_mode &&
+                        (entered < goal->start_page || entered > goal->end_page)))
+                        throw std::invalid_argument("invalid progress");
+                    store.checkpoint(); store.add_goal_entry(goal->id, date, value, note);
+                    refresh_state(state, store, state.now); state.message = book_mode ?
+                        "Current page recorded." : "Goal datapoint recorded.";
+                } catch (const std::exception&) { state.message = book_mode ?
+                    "Invalid current page." : "Invalid datapoint amount."; }
             }
         }
         else if (state.view == planner::View::Todos && key == 'u') {
@@ -1728,13 +2259,34 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
             state.message = "Moving card; press Space to drop.";
         }
         else if (key == 27) {
-            if (state.view == planner::View::EditTask) state.view = planner::View::Task;
+            if (state.view == planner::View::Tracker && state.tracker_boundary_dragging) {
+                state.tracker_boundary_dragging = false;
+                state.boundary_left_session_id.reset();
+                state.boundary_right_session_id.reset();
+                state.message = "Timeline boundary drag cancelled.";
+            }
+            else if (state.view == planner::View::EditTask) state.view = planner::View::Task;
             else if (state.view == planner::View::TaskChecklist) state.view = planner::View::Task;
             else if (state.view == planner::View::EditGoal) {
                 state.view = state.previous_view == planner::View::Gantt ? planner::View::Gantt : planner::View::Goals;
                 state.editing_goal_id.reset();
             }
-            else if (state.view == planner::View::SessionTaskPicker) state.view = planner::View::EditSession;
+            else if (state.view == planner::View::SessionTaskPicker && state.session_picker_returns_tracker) {
+                state.view = planner::View::Tracker;
+                state.editing_session_id.reset(); state.session_picker_returns_tracker = false;
+                state.task_picker_query.clear(); state.task_picker_search_focused = true;
+                state.message = "Interval split; second half kept the same activity.";
+            }
+            else if (state.view == planner::View::SessionTaskPicker) {
+                state.view = planner::View::EditSession;
+                state.task_picker_query.clear(); state.task_picker_search_focused = true;
+            }
+            else if (state.view == planner::View::TrackerBoundary) {
+                state.view = planner::View::Tracker;
+                state.tracker_boundary_dragging = false;
+                state.boundary_left_session_id.reset(); state.boundary_right_session_id.reset();
+                state.message = "Boundary move cancelled.";
+            }
             else if (state.view == planner::View::EditSession) { state.view = planner::View::Tracker; state.editing_session_id.reset(); }
             else if (state.view == planner::View::Task) state.view = state.previous_view;
             else { state.previous_view = state.view; state.view = planner::View::Menu; state.today_focused = false; }

@@ -70,6 +70,26 @@ void model_and_storage() {
     state = store.load(start + std::chrono::minutes(25));
     require(!state.timer_task_id, "timer did not stop");
     require(state.tasks[0].tracked_seconds == 1500, "stored duration is wrong");
+    const auto overnight_midpoint = planner::parse_time("2026-08-20T00:30:00");
+    const auto displayed_tracker_date = planner::parse_time("2026-08-19T12:00:00");
+    require(planner::resolve_split_time(overnight_midpoint, displayed_tracker_date, "", "23:45") ==
+            planner::parse_time("2026-08-19T23:45:00"),
+            "a split time without a date did not use the displayed Tracker day");
+    require(planner::resolve_split_time(overnight_midpoint, displayed_tracker_date, "", "") ==
+            overnight_midpoint, "an entirely blank split did not retain the exact midpoint");
+    const auto spread_marks = planner::spread_timeline_marks({4, 4, 4}, 8);
+    require(spread_marks.size() == 3 && spread_marks[0] < spread_marks[1] &&
+            spread_marks[1] < spread_marks[2],
+            "compressed timeline activities did not retain distinct visible marks");
+    require(planner::activity_symbol(1) != planner::activity_symbol(8) &&
+            planner::activity_symbol(8) == planner::activity_symbol(8),
+            "activities with colliding colour slots did not receive distinct stable symbols");
+    planner::Project searchable_project; searchable_project.name = "Research";
+    planner::Task searchable_task; searchable_task.title = "Read archive"; searchable_task.tags = "history";
+    require(planner::activity_matches_query(searchable_task, &searchable_project, "ARCHIVE") &&
+            planner::activity_matches_query(searchable_task, &searchable_project, "research") &&
+            !planner::activity_matches_query(searchable_task, &searchable_project, "exercise"),
+            "activity search did not match title/project case-insensitively or reject unrelated text");
     store.remember_paused_task(task);
     state = store.load(start + std::chrono::minutes(25));
     require(state.paused_task_id == task, "paused task was not persisted");
@@ -145,13 +165,63 @@ void model_and_storage() {
     store.add_goal_entry(goal, "2026-08-19", 12.5, "Restored");
     state.goals[0].daily_goal = 15;
     state.goals[0].comment = "Updated comment\nwith a second line";
-    store.update_goal(state.goals[0]);
-    const auto updated_goal = store.load(start).goals[0];
-    require(updated_goal.daily_goal == 15 && updated_goal.comment == "Updated comment\nwith a second line",
+    store.update_goal(state.goals[0], "2026-08-20");
+    const auto updated_state = store.load(start);
+    const auto updated_goal = updated_state.goals[0];
+    require(updated_goal.daily_goal == 15 && updated_goal.comment == "Updated comment\nwith a second line" &&
+            planner::goal_daily_target_on(updated_state, updated_goal, "2026-08-19") == 12 &&
+            planner::goal_daily_target_on(updated_state, updated_goal, "2026-08-20") == 15 &&
+            planner::goal_expected_on(updated_state, updated_goal, "2026-08-19") == 12 &&
+            planner::goal_expected_on(updated_state, updated_goal, "2026-08-20") == 27,
             "goal field or comment edit was not persisted");
+    require(!planner::goal_complete_on(updated_state, updated_goal, "2026-08-20"),
+            "a daily-only goal was incorrectly treated as complete");
     store.delete_goal(goal);
     state = store.load(start);
-    require(state.goals.empty() && state.goal_entries.empty(), "goal deletion did not remove datapoints");
+    require(state.goals.empty() && state.goal_entries.empty() && state.goal_daily_targets.empty(),
+            "goal deletion did not remove datapoints or daily-target history");
+    const int finite_goal = store.add_goal("Finish report", "pages", 20, "2026-08-19", "", 10);
+    store.add_goal_entry(finite_goal, "2026-08-19", 10, "Halfway");
+    state = store.load(start);
+    require(!planner::goal_complete_on(state, state.goals[0], "2026-08-19"),
+            "an unfinished final goal was treated as complete");
+    store.add_goal_entry(finite_goal, "2026-08-20", 10, "Finished");
+    state = store.load(start);
+    require(!planner::goal_complete_on(state, state.goals[0], "2026-08-19") &&
+            planner::goal_complete_on(state, state.goals[0], "2026-08-20"),
+            "goal completion was not evaluated through the requested date");
+    store.delete_goal(finite_goal);
+    const int book_goal = store.add_goal("Long novel", "pages", 300, "2026-08-19", "", 10,
+                                         {}, true, 10, 310);
+    store.add_goal_entry(book_goal, "2026-08-19", 40, "Initial current page");
+    state = store.load(start);
+    require(state.goals.size() == 1 && state.goals[0].book_mode && state.goals[0].start_page == 10 &&
+            state.goals[0].end_page == 310 && planner::book_current_page_on(
+                state, state.goals[0], "2026-08-19") == 50 &&
+            planner::goal_expected_on(state, state.goals[0], "2026-08-19") == 10 &&
+            !planner::goal_complete_on(state, state.goals[0], "2026-08-19"),
+            "reading goal pages, daily target, or current-page progress were not persisted");
+    auto changed_book_goal = state.goals[0];
+    changed_book_goal.daily_goal = 15;
+    store.update_goal(changed_book_goal, "2026-08-20");
+    store.reset_goal_pace(book_goal, "2026-08-20", 40);
+    store.add_goal_entry(book_goal, "2026-08-20", 260, "Finished book");
+    state = store.load(start);
+    require(planner::book_current_page_on(state, state.goals[0], "2026-08-20") == 310 &&
+            planner::goal_daily_target_on(state, state.goals[0], "2026-08-19") == 10 &&
+            planner::goal_daily_target_on(state, state.goals[0], "2026-08-20") == 15 &&
+            planner::goal_expected_on(state, state.goals[0], "2026-08-19") == 10 &&
+            planner::goal_expected_on(state, state.goals[0], "2026-08-20") == 55 &&
+            planner::goal_complete_on(state, state.goals[0], "2026-08-20"),
+            "reading goal pace reset or ending-page completion is wrong");
+    store.delete_goal(book_goal);
+    require(store.load(start).goal_pace_resets.empty(), "goal deletion did not remove pace resets");
+    planner::State calendar_state;
+    planner::Goal calendar_goal;
+    calendar_goal.id = 99; calendar_goal.daily_goal = 1; calendar_goal.start_date = "2026-10-24";
+    calendar_state.goal_daily_targets = {{99, "2026-10-24", 1}, {99, "2026-10-25", 2}};
+    require(planner::goal_expected_on(calendar_state, calendar_goal, "2026-10-26") == 5,
+            "daily-goal history did not count calendar days correctly across a clock change");
     const int manual = store.add_session(task, planner::parse_time("2026-08-19T09:00:00"),
                                          planner::parse_time("2026-08-19T10:00:00"));
     store.update_session(manual, planner::parse_time("2026-08-19T09:15:00"),
@@ -184,6 +254,42 @@ void model_and_storage() {
     require(std::find_if(state.tasks.begin(), state.tasks.end(), [second, destination](const planner::Task& item) {
         return item.id == second && item.project_id == destination;
     }) != state.tasks.end(), "task project transfer was not persisted");
+    const int split_source = store.add_session(task, planner::parse_time("2026-08-19T15:00:00"),
+                                               planner::parse_time("2026-08-19T17:00:00"));
+    bool rejected_endpoint_split = false;
+    try {
+        store.split_session(split_source, planner::parse_time("2026-08-19T15:00:00"), second);
+    } catch (const std::exception&) { rejected_endpoint_split = true; }
+    require(rejected_endpoint_split, "an interval was split at its endpoint");
+    const int split_second = store.split_session(split_source, planner::parse_time("2026-08-19T16:00:00"), second);
+    state = store.load(start);
+    const auto split_left = std::find_if(state.sessions.begin(), state.sessions.end(),
+        [split_source](const auto& session) { return session.id == split_source; });
+    const auto split_right = std::find_if(state.sessions.begin(), state.sessions.end(),
+        [split_second](const auto& session) { return session.id == split_second; });
+    require(split_left != state.sessions.end() && split_right != state.sessions.end() &&
+            split_left->ended_at == planner::parse_time("2026-08-19T16:00:00") &&
+            split_right->started_at == planner::parse_time("2026-08-19T16:00:00") &&
+            split_right->ended_at == planner::parse_time("2026-08-19T17:00:00") &&
+            split_right->task_id == second,
+            "tracked interval split did not preserve its range or assign its second half");
+    store.move_session_boundary(split_source, split_second, planner::parse_time("2026-08-19T15:30:00"));
+    state = store.load(start);
+    const auto moved_left = std::find_if(state.sessions.begin(), state.sessions.end(),
+        [split_source](const auto& session) { return session.id == split_source; });
+    const auto moved_right = std::find_if(state.sessions.begin(), state.sessions.end(),
+        [split_second](const auto& session) { return session.id == split_second; });
+    require(moved_left != state.sessions.end() && moved_right != state.sessions.end() &&
+            moved_left->ended_at == planner::parse_time("2026-08-19T15:30:00") &&
+            moved_right->started_at == planner::parse_time("2026-08-19T15:30:00") &&
+            std::chrono::duration_cast<std::chrono::hours>(
+                *moved_right->ended_at - moved_left->started_at).count() == 2,
+            "shared boundary move changed the combined range");
+    bool rejected_crossed_boundary = false;
+    try {
+        store.move_session_boundary(split_source, split_second, planner::parse_time("2026-08-19T17:00:00"));
+    } catch (const std::exception&) { rejected_crossed_boundary = true; }
+    require(rejected_crossed_boundary, "a shared boundary was allowed to cross an interval endpoint");
     store.checkpoint();
     store.archive_task(second);
     state = store.load(start);
@@ -346,10 +452,19 @@ void rendering() {
     require(tracker.find("00:00") != std::string::npos && tracker.find("[] ") != std::string::npos &&
             tracker.find('=') != std::string::npos,
             "tracker activity timeline is missing");
+    require(tracker.find("x split") != std::string::npos && tracker.find("b boundary") != std::string::npos,
+            "tracker split or shared-boundary controls are missing");
     require(tracker.find("[] Sleep") != std::string::npos && tracker.find('z') != std::string::npos,
             "sleep timeline styling is missing");
     require(tracker.find("00:00-00:30") != std::string::npos,
             "tracker does not show the portion of an interval overlapping the selected day");
+    state.tracker_timeline_focused = true;
+    state.tracker_cursor_minutes = 8 * 60 + 15;
+    tracker = planner::render_text(state, 120, 32);
+    require(tracker.find("^ 08:15") != std::string::npos && tracker.find("[/] 5m") != std::string::npos &&
+            tracker.find("e edit activity") != std::string::npos,
+            "Tracker timeline cursor is missing its live time marker or controls");
+    state.tracker_timeline_focused = false;
     state.tracker_row = -1;
     tracker = planner::render_text(state, 120, 32);
     require(tracker.find("> TRACKED DATE") != std::string::npos && tracker.find("Enter calendar") != std::string::npos,
@@ -368,6 +483,32 @@ void rendering() {
             session_editor.find("End date") != std::string::npos &&
             session_editor.find("End time") != std::string::npos,
             "tracked interval date and time fields are not independently selectable");
+    const int boundary_right = store.add_session(call_id, planner::parse_time("2026-08-19T08:30:00"),
+                                                  planner::parse_time("2026-08-19T09:00:00"));
+    state = store.load(planner::parse_time("2026-08-19T10:00:00"));
+    state.view = planner::View::TrackerBoundary;
+    state.boundary_left_session_id = rendered_session;
+    state.boundary_right_session_id = boundary_right;
+    state.tracker_boundary = planner::parse_time("2026-08-19T08:20:00");
+    const auto boundary_editor = planner::render_text(state, 120, 32);
+    require(boundary_editor.find("MOVE SHARED BOUNDARY") != std::string::npos &&
+            boundary_editor.find("08:00 - 08:20") != std::string::npos &&
+            boundary_editor.find("08:20 - 09:00") != std::string::npos &&
+            boundary_editor.find("h/l +/-5m") != std::string::npos &&
+            boundary_editor.find("Enter save") != std::string::npos,
+            "shared-boundary preview is missing activities, durations, or controls");
+    state.view = planner::View::Tracker;
+    state.tracker_timeline_focused = true;
+    state.tracker_boundary_dragging = true;
+    state.tracker_cursor_minutes = 8 * 60 + 20;
+    const auto boundary_drag = planner::render_text(state, 120, 32);
+    require(boundary_drag.find("08:00-08:20") != std::string::npos &&
+            boundary_drag.find("08:20-09:00") != std::string::npos &&
+            boundary_drag.find("BOUNDARY DRAG") != std::string::npos &&
+            boundary_drag.find("Enter save") != std::string::npos,
+            "inline timeline boundary drag is missing its live segment preview or controls");
+    state.tracker_boundary_dragging = false;
+    state.tracker_timeline_focused = false;
     state.calendar_selecting_session_date = 1;
     state.calendar_date = planner::parse_time("2026-08-18T08:00:00");
     state.view = planner::View::Calendar;
@@ -378,8 +519,25 @@ void rendering() {
     state.view = planner::View::SessionTaskPicker;
     auto picker = planner::render_text(state, 120, 32);
     require(picker.find("MOVE TRACKED INTERVAL TO TASK") != std::string::npos &&
-            picker.find("[-]") != std::string::npos && picker.find("Sort papers") != std::string::npos,
+            picker.find("> Search  _") != std::string::npos &&
+            picker.find("[-]") != std::string::npos && picker.find("Sort papers") != std::string::npos &&
+            picker.find("Type to filter") != std::string::npos,
             "tracked interval task picker hierarchy is missing");
+    state.task_picker_query = "sort";
+    picker = planner::render_text(state, 80, 32);
+    require(picker.find("Search  sort_") != std::string::npos &&
+            picker.find("Sort papers") != std::string::npos &&
+            picker.find("Call adviser") == std::string::npos,
+            "activity picker search did not filter its live results");
+    state.task_picker_query.clear();
+    state.session_picker_returns_tracker = true;
+    state.editing_session_id = rendered_session;
+    picker = planner::render_text(state, 120, 32);
+    require(picker.find("CHOOSE ACTIVITY FOR SECOND HALF") != std::string::npos &&
+            picker.find("Split already created at 2026-08-19 08:00") != std::string::npos &&
+            picker.find("Esc keep same activity") != std::string::npos,
+            "split interval activity picker is missing its split-specific controls");
+    state.session_picker_returns_tracker = false;
     const int picker_project = state.projects.back().id;
     for (int i = 0; i < 18; ++i)
         store.add_task(picker_project, "Overflow activity " + std::to_string(i), planner::Status::Done);
@@ -442,6 +600,8 @@ void rendering() {
                                              "Keep this visible in the goal editor.\nCapture obstacles and next steps.");
     store.add_goal_entry(reading_goal, "2026-08-19", 10, "First session");
     store.add_goal("Meditate", "sessions", 0, "2026-08-19", "", 1);
+    const int finished_goal = store.add_goal("Finished milestone", "items", 5, "2026-08-18", "", 5);
+    store.add_goal_entry(finished_goal, "2026-08-19", 5, "Done");
     state = store.load(planner::parse_time("2026-08-19T10:00:00"));
     state.view = planner::View::Todos; state.todo_list = 0;
     todos = planner::render_text(state, 120, 32);
@@ -451,6 +611,14 @@ void rendering() {
             todos.find("10/10 pages today") != std::string::npos &&
             todos.find("[ ] Meditate") != std::string::npos && todos.find("0/1 sessions today") != std::string::npos,
             "Daily Todos goal completion does not reflect the daily target fraction");
+    require(todos.find("Finished milestone") == std::string::npos,
+            "a completed final goal is still present in Daily Todos");
+    state.todo_date = planner::parse_time("2026-08-18T10:00:00");
+    todos = planner::render_text(state, 120, 32);
+    require(todos.find("Finished milestone") != std::string::npos,
+            "a goal was hidden from a historical day before it was completed");
+    store.delete_goal(finished_goal);
+    state = store.load(planner::parse_time("2026-08-19T10:00:00"));
     state.view = planner::View::Goals;
     const auto goals = planner::render_text(state, 120, 32);
     require(goals.find("Read consistently") != std::string::npos && goals.find("Daily goal 10") != std::string::npos &&
@@ -460,6 +628,49 @@ void rendering() {
             "goal view lacks progress or pace information");
     require(goals.find("total 0  goal 1  net -1  daily 1") != std::string::npos,
             "unselected goal overview lacks current goal and net metrics");
+    auto changed_reading_goal = *std::find_if(state.goals.begin(), state.goals.end(),
+        [reading_goal](const auto& goal) { return goal.id == reading_goal; });
+    changed_reading_goal.daily_goal = 20;
+    store.update_goal(changed_reading_goal, "2026-08-20");
+    state = store.load(planner::parse_time("2026-08-19T10:00:00"));
+    state.view = planner::View::Todos; state.todo_list = 0;
+    todos = planner::render_text(state, 120, 32);
+    require(todos.find("10/10 pages today") != std::string::npos,
+            "a later daily-goal edit changed an earlier Daily Todos target");
+    state = store.load(planner::parse_time("2026-08-20T10:00:00"));
+    state.view = planner::View::Todos; state.todo_list = 0;
+    todos = planner::render_text(state, 120, 32);
+    require(todos.find("0/20 pages today") != std::string::npos,
+            "a daily-goal edit did not take effect on its effective date");
+    state.view = planner::View::Goals;
+    const auto changed_goals = planner::render_text(state, 120, 32);
+    require(changed_goals.find("Current goal 30") != std::string::npos &&
+            changed_goals.find("Daily goal 20") != std::string::npos,
+            "goal pace was recalculated retroactively after a daily-goal edit");
+    const int book = store.add_goal("The Long Book", "pages", 290, "2026-08-20", "", 20,
+                                    {}, true, 10, 300);
+    store.add_goal_entry(book, "2026-08-20", 35, "Reached page 45");
+    state = store.load(planner::parse_time("2026-08-20T10:00:00"));
+    state.view = planner::View::Todos; state.todo_list = 0;
+    todos = planner::render_text(state, 120, 32);
+    require(todos.find("The Long Book") != std::string::npos &&
+            todos.find("{reading} page 45/300") != std::string::npos &&
+            todos.find("today 35/20 pages | read 35 | current goal 20 | net +15") != std::string::npos,
+            "Daily Todos does not show reading progress, daily pages, and net position");
+    state.view = planner::View::Goals; state.goal_row = static_cast<int>(state.goals.size()) - 1;
+    const auto book_goals = planner::render_text(state, 120, 32);
+    require(book_goals.find("READING  page 45/300") != std::string::npos &&
+            book_goals.find("goal 20  net +15  daily 20") != std::string::npos &&
+            book_goals.find("Pages  start 10  |  current 45  |  end 300") != std::string::npos,
+            "Goals view does not show reading pages, target pace, and net position");
+    state.view = planner::View::EditGoal; state.editing_goal_id = book; state.goal_edit_row = 3;
+    const auto book_editor = planner::render_text(state, 120, 32);
+    require(book_editor.find("EDIT READING GOAL") != std::string::npos &&
+            book_editor.find("Starting page  10") != std::string::npos &&
+            book_editor.find("End page  300") != std::string::npos &&
+            book_editor.find("> Current page  45") != std::string::npos &&
+            book_editor.find("Daily pages  20") != std::string::npos,
+            "reading goal editor is missing its page or daily-target fields");
     state.view = planner::View::EditGoal; state.editing_goal_id = reading_goal; state.goal_edit_row = 2;
     const auto goal_editor = planner::render_text(state, 120, 32);
     require(goal_editor.find("EDIT GOAL") != std::string::npos &&

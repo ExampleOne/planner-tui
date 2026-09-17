@@ -230,6 +230,19 @@ std::string clock_hhmm(TimePoint point, bool seconds = false) {
     return out.str();
 }
 
+std::string minute_hhmm(int minutes) {
+    minutes = std::clamp(minutes, 0, 1439);
+    std::ostringstream out;
+    out << std::setfill('0') << std::setw(2) << minutes / 60 << ':'
+        << std::setw(2) << minutes % 60;
+    return out.str();
+}
+
+int timeline_cursor_offset(const State& state, int bar_width) {
+    return std::clamp(state.tracker_cursor_minutes * std::max(0, bar_width - 1) / 1439,
+                      0, std::max(0, bar_width - 1));
+}
+
 void today_rail(Canvas& canvas, const State& state, int width, int height) {
     canvas.box(0, 0, width, height);
     canvas.text(2, 0, state.today_focused ? " TODAY [ACTIVE] " : " TODAY ");
@@ -654,10 +667,68 @@ void edit_task(Canvas& canvas, const State& state, int width, int height) {
     canvas.text(2, height - 2, "j/k field  Enter edit  Ctrl+Z undo  Ctrl+Y redo  Esc return");
 }
 
+std::pair<TimePoint, TimePoint> tracker_session_visual_bounds(const State& state, const Session& session) {
+    TimePoint start = session.started_at;
+    TimePoint end = session.ended_at.value_or(state.now);
+    if (state.tracker_boundary_dragging) {
+        if (state.boundary_left_session_id && session.id == *state.boundary_left_session_id)
+            end = state.tracker_boundary;
+        if (state.boundary_right_session_id && session.id == *state.boundary_right_session_id)
+            start = state.tracker_boundary;
+    }
+    return {start, end};
+}
+
+struct TimelineMark {
+    int id{};
+    bool allowance{};
+    TimePoint first{};
+    int preferred{};
+    char marker{};
+};
+
+std::vector<TimelineMark> timeline_activity_marks(const State& state, TimePoint day_start,
+                                                  TimePoint day_end, int bar_width) {
+    const long long day_seconds = std::max<long long>(1,
+        std::chrono::duration_cast<std::chrono::seconds>(day_end - day_start).count());
+    std::vector<TimelineMark> marks;
+    auto add = [&](int id, bool allowance, TimePoint raw_start, TimePoint raw_end, char marker) {
+        if (raw_start >= day_end || raw_end <= day_start) return;
+        if (std::any_of(marks.begin(), marks.end(), [id, allowance](const auto& item) {
+                return item.id == id && item.allowance == allowance;
+            })) return;
+        const auto start = std::max(raw_start, day_start);
+        const auto end = std::min(raw_end, day_end);
+        const auto middle = start + (end - start) / 2;
+        const auto from = std::chrono::duration_cast<std::chrono::seconds>(middle - day_start).count();
+        marks.push_back({id, allowance, start,
+            std::clamp(static_cast<int>(from * std::max(0, bar_width - 1) / day_seconds),
+                       0, std::max(0, bar_width - 1)), marker});
+    };
+    for (const auto& session : state.sessions) {
+        const auto [start, end] = tracker_session_visual_bounds(state, session);
+        const auto* task = task_by_id(state, session.task_id);
+        add(session.task_id, false, start, end,
+            activity_symbol(session.task_id, false, task && is_sleep_name(task->title)));
+    }
+    for (const auto& session : state.allowance_sessions)
+        add(session.allowance_id, true, session.started_at, session.ended_at.value_or(state.now), '~');
+    std::sort(marks.begin(), marks.end(), [](const auto& left, const auto& right) {
+        return std::tuple{left.preferred, left.first, left.allowance, left.id} <
+               std::tuple{right.preferred, right.first, right.allowance, right.id};
+    });
+    std::vector<int> preferred;
+    for (const auto& mark : marks) preferred.push_back(mark.preferred);
+    const auto positions = spread_timeline_marks(preferred, bar_width);
+    for (int i = 0; i < static_cast<int>(positions.size()); ++i) marks[i].preferred = positions[i];
+    return marks;
+}
+
 void tracker(Canvas& canvas, const State& state, int width, int height, bool show_focus = true) {
     frame(canvas, width, height, state, "Planner / Tracker");
     const std::string today = date_iso(state.tracker_date);
-    canvas.text(3, 2, std::string(state.tracker_row < 0 ? "> " : "  ") + "TRACKED DATE  " + today);
+    canvas.text(3, 2, std::string(state.tracker_row < 0 && !state.tracker_timeline_focused ? "> " : "  ") +
+        "TRACKED DATE  " + today);
     canvas.text(3, 3, "ID    TIME           DURATION    PROJECT / TASK");
     canvas.hline(2, 4, width - 4);
     const auto [day_start, day_end] = local_day_bounds(state.tracker_date);
@@ -679,11 +750,11 @@ void tracker(Canvas& canvas, const State& state, int width, int height, bool sho
     int index = 0;
     long long total = 0;
     for (const auto& session : state.sessions) {
-        const TimePoint actual_end = session.ended_at.value_or(state.now);
-        if (session.started_at >= day_end || actual_end <= day_start) continue;
+        const auto [actual_start, actual_end] = tracker_session_visual_bounds(state, session);
+        if (actual_start >= day_end || actual_end <= day_start) continue;
         const auto* task = task_by_id(state, session.task_id);
         const auto* project = task ? project_by_id(state, task->project_id) : nullptr;
-        const TimePoint start = std::max(session.started_at, day_start);
+        const TimePoint start = std::max(actual_start, day_start);
         const TimePoint end = std::min(actual_end, day_end);
         const long long seconds = std::max<long long>(0,
             std::chrono::duration_cast<std::chrono::seconds>(end - start).count());
@@ -692,7 +763,8 @@ void tracker(Canvas& canvas, const State& state, int width, int height, bool sho
         const bool live_now = !session.ended_at && end == state.now;
         const std::string times = clock_hhmm(start) + "-" + (live_now ? "NOW  " : clock_hhmm(end));
         std::ostringstream line;
-        line << (index == state.tracker_row ? "> " : "  ") << std::setw(4) << session.id << "  "
+        line << (index == state.tracker_row && !state.tracker_timeline_focused ? "> " : "  ")
+             << std::setw(4) << session.id << "  "
              << times << "  " << duration(seconds) << "  "
              << (project ? project->name : "Unknown") << " / " << (task ? task->title : "Unknown task");
         canvas.text(2, y++, clip(line.str(), width - 4));
@@ -749,16 +821,33 @@ void tracker(Canvas& canvas, const State& state, int width, int height, bool sho
     canvas.text(bar_x + bar_width * 3 / 4, bar_y - 1, "18:00");
     canvas.text(std::max(bar_x, bar_x + bar_width - 5), bar_y - 1, "24:00");
     canvas.text(bar_x, bar_y, std::string(bar_width, '.'));
-    for (const auto& session : state.sessions)
-        draw_segment(session.started_at, session.ended_at.value_or(state.now),
+    for (const auto& session : state.sessions) {
+        const auto [start, end] = tracker_session_visual_bounds(state, session);
+        draw_segment(start, end,
                      ([&] { const auto* task = task_by_id(state, session.task_id);
-                            return task && is_sleep_name(task->title) ? 'z' : '='; })());
+                            return activity_symbol(session.task_id, false,
+                                task && is_sleep_name(task->title)); })());
+    }
     for (const auto& session : state.allowance_sessions)
         draw_segment(session.started_at, session.ended_at.value_or(state.now), '~');
+    for (const auto& mark : timeline_activity_marks(state, day_start, day_end, bar_width))
+        canvas.text(bar_x + mark.preferred, bar_y, std::string(1, mark.marker));
+    if (state.tracker_timeline_focused) {
+        const int cursor_x = timeline_cursor_offset(state, bar_width);
+        const std::string time = minute_hhmm(state.tracker_cursor_minutes);
+        const std::string suffix = state.tracker_boundary_dragging ? " BOUNDARY DRAG" : "";
+        if (cursor_x + 7 + static_cast<int>(suffix.size()) < bar_width)
+            canvas.text(bar_x + cursor_x, bar_y + 1, "^ " + time + suffix);
+        else canvas.text(std::max(bar_x, bar_x + cursor_x - 6), bar_y + 1, time + " ^");
+    }
     if (show_focus) focus_panel(canvas, state, width, height);
-    canvas.text(2, height - 2, state.tracker_row < 0 ?
+    canvas.text(2, height - 2, state.tracker_boundary_dragging ?
+        "DRAG BOUNDARY  h/l 15m  [/] 5m  H/L 1h  Enter save  Esc cancel" :
+        state.tracker_timeline_focused ?
+        "h/l 15m  [/] 5m  H/L 1h  x split  b boundary  e edit activity  Up intervals" :
+        state.tracker_row < 0 ?
         "h/l or Left/Right day  Enter calendar  g today  Down intervals  M Views" :
-        "j/k select (Up to date)  e edit interval  n manual interval  M Views  q quit");
+        "j/k select  e edit  x split  b boundary  n manual  M Views  q quit");
 }
 
 void edit_session(Canvas& canvas, const State& state, int width, int height) {
@@ -787,12 +876,63 @@ void edit_session(Canvas& canvas, const State& state, int width, int height) {
     canvas.text(2, height - 2, "j/k field  e/Enter change  Esc tracker  Ctrl+Z undo  Ctrl+Y redo");
 }
 
-void session_task_picker(Canvas& canvas, const State& state, int width, int height) {
-    frame(canvas, width, height, state, "Planner / Choose Task");
-    canvas.text(3, 2, "MOVE TRACKED INTERVAL TO TASK");
+void tracker_boundary(Canvas& canvas, const State& state, int width, int height) {
+    frame(canvas, width, height, state, "Planner / Move Shared Boundary");
+    const auto left = std::find_if(state.sessions.begin(), state.sessions.end(), [&state](const auto& session) {
+        return state.boundary_left_session_id && session.id == *state.boundary_left_session_id;
+    });
+    const auto right = std::find_if(state.sessions.begin(), state.sessions.end(), [&state](const auto& session) {
+        return state.boundary_right_session_id && session.id == *state.boundary_right_session_id;
+    });
+    if (left == state.sessions.end() || right == state.sessions.end() || !left->ended_at) {
+        canvas.text(3, 3, "Shared boundary is no longer available.");
+        canvas.text(2, height - 2, "Esc tracker");
+        return;
+    }
+    const auto* left_task = task_by_id(state, left->task_id);
+    const auto* right_task = task_by_id(state, right->task_id);
+    const auto right_end = right->ended_at.value_or(state.now);
+    const auto left_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        state.tracker_boundary - left->started_at).count();
+    const auto right_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        right_end - state.tracker_boundary).count();
+    canvas.text(3, 2, "MOVE SHARED BOUNDARY");
     canvas.hline(2, 4, width - 4);
+    canvas.text(3, 6, "Left   " + clip(left_task ? left_task->title : "Unknown task", width - 12));
+    canvas.text(7, 7, clock_hhmm(left->started_at) + " - " + clock_hhmm(state.tracker_boundary) +
+        "   " + duration(left_seconds));
+    canvas.text(3, 9, "Right  " + clip(right_task ? right_task->title : "Unknown task", width - 12));
+    canvas.text(7, 10, clock_hhmm(state.tracker_boundary) + " - " +
+        (right->ended_at ? clock_hhmm(*right->ended_at) : "NOW") + "   " + duration(right_seconds));
+    canvas.text(3, 13, "Boundary  " + date_iso(state.tracker_boundary) + " " +
+        clock_hhmm(state.tracker_boundary, true));
+    canvas.text(3, 15, "Moving this boundary preserves the combined tracked time.");
+    canvas.text(2, height - 2,
+        "h/l +/-5m  H/L +/-15m  e exact date/time  Enter save  Esc cancel");
+}
+
+void session_task_picker(Canvas& canvas, const State& state, int width, int height) {
+    frame(canvas, width, height, state, state.session_picker_returns_tracker ?
+        "Planner / Choose Second Activity" : "Planner / Choose Task");
+    canvas.text(3, 2, state.session_picker_returns_tracker ?
+        "CHOOSE ACTIVITY FOR SECOND HALF" : "MOVE TRACKED INTERVAL TO TASK");
+    if (state.session_picker_returns_tracker && state.editing_session_id) {
+        const auto found = std::find_if(state.sessions.begin(), state.sessions.end(), [&state](const auto& session) {
+            return session.id == *state.editing_session_id;
+        });
+        if (found != state.sessions.end())
+            canvas.text(3, 3, clip("Split already created at " + date_iso(found->started_at) + " " +
+                clock_hhmm(found->started_at) + ". Choose the second activity.", width - 6));
+    }
+    canvas.text(3, 4, std::string(state.task_picker_search_focused ? "> Search  " : "  Search  ") +
+        clip(state.task_picker_query + (state.task_picker_search_focused ? "_" : ""), width - 15));
+    canvas.hline(2, 6, width - 4);
     std::vector<const Task*> tasks;
-    for (const auto& task : state.tasks) if (!task.archived) tasks.push_back(&task);
+    for (const auto& task : state.tasks) {
+        const auto* project = project_by_id(state, task.project_id);
+        if (!task.archived && activity_matches_query(task, project, state.task_picker_query))
+            tasks.push_back(&task);
+    }
     std::sort(tasks.begin(), tasks.end(), [&state](const auto* left, const auto* right) {
         auto order = [&state](int id) {
             const auto found = std::find_if(state.projects.begin(), state.projects.end(),
@@ -826,18 +966,25 @@ void session_task_picker(Canvas& canvas, const State& state, int width, int heig
     int selected_line = 0;
     for (int i = 0; i < static_cast<int>(lines.size()); ++i)
         if (lines[i].task_index == state.task_picker_row) { selected_line = i; break; }
-    const int visible = std::max(1, height - 8);
+    const int visible = std::max(1, height - 10);
     const int first = std::max(0, std::min(selected_line - visible / 2,
                                            static_cast<int>(lines.size()) - visible));
     for (int i = first; i < static_cast<int>(lines.size()) && i < first + visible; ++i) {
-        const bool selected = lines[i].task_index == state.task_picker_row;
-        canvas.text(3, 5 + i - first, std::string(selected ? "> " : "  ") +
+        const bool selected = !state.task_picker_search_focused && lines[i].task_index == state.task_picker_row;
+        canvas.text(3, 7 + i - first, std::string(selected ? "> " : "  ") +
             clip(lines[i].text, width - 8));
     }
-    if (tasks.empty()) canvas.text(3, 6, "No tasks available.");
-    if (first > 0) canvas.text(width - 5, 3, "^");
+    if (tasks.empty()) canvas.text(3, 8, state.task_picker_query.empty() ?
+        "No activities available." : "No activities match this search.");
+    if (first > 0) canvas.text(width - 5, 5, "^");
     if (first + visible < static_cast<int>(lines.size())) canvas.text(width - 5, height - 3, "v");
-    canvas.text(2, height - 2, "j/k select  Enter choose  Esc cancel");
+    if (state.task_picker_search_focused)
+        canvas.text(2, height - 2, state.session_picker_returns_tracker ?
+            "Type to filter  Backspace erase  Enter results  Esc keep same activity" :
+            "Type to filter  Backspace erase  Enter results  Esc cancel");
+    else canvas.text(2, height - 2, state.session_picker_returns_tracker ?
+        "j/k select  Enter assign  / search  Esc keep same activity" :
+        "j/k select  Enter choose  / search  Esc cancel");
 }
 
 void allowances(Canvas& canvas, const State& state, int width, int height, bool show_focus = true) {
@@ -916,16 +1063,35 @@ void todos(Canvas& canvas, const State& state, int width, int height, bool show_
         }
         for (const auto& goal : state.goals) {
             if (goal.start_date > day || (!goal.target_date.empty() && goal.target_date < day) ||
+                goal_complete_on(state, goal, day) ||
                 y >= height - (show_focus ? 7 : 3)) continue;
             const bool selected = index == state.todo_row;
             double daily_total = 0;
             for (const auto& entry : state.goal_entries)
                 if (entry.goal_id == goal.id && entry.date == day) daily_total += entry.amount;
-            const bool filled = goal.daily_goal > 0 && daily_total >= goal.daily_goal;
+            if (goal.book_mode) {
+                const double current_page = book_current_page_on(state, goal, day);
+                const double daily_goal = goal_daily_target_on(state, goal, day);
+                const bool filled = daily_goal > 0 && daily_total >= daily_goal;
+                const auto metrics = goal_metrics(state, goal, day);
+                canvas.text(3, y++, std::string(selected ? "> " : "  ") + (filled ? "[x] " : "[ ] ") +
+                    clip(goal.title, std::max(8, width - 37)) + "  {reading} page " + number(current_page) +
+                    "/" + number(goal.end_page));
+                if (y < height - (show_focus ? 7 : 3))
+                    canvas.text(8, y++, "today " + number(daily_total) + "/" + number(daily_goal) +
+                        " pages | read " + number(metrics.total) + " | current goal " +
+                        number(metrics.current_goal) + " | net " +
+                        (metrics.net >= 0 ? "+" : "") + number(metrics.net));
+                completed += filled ? 1 : 0;
+                ++index;
+                continue;
+            }
+            const double daily_goal = goal_daily_target_on(state, goal, day);
+            const bool filled = daily_goal > 0 && daily_total >= daily_goal;
             const auto metrics = goal_metrics(state, goal, day);
             canvas.text(3, y++, std::string(selected ? "> " : "  ") + (filled ? "[x] " : "[ ] ") +
                 clip(goal.title, std::max(8, width - 36)) + "  {goal} " + number(daily_total) + "/" +
-                number(goal.daily_goal) + " " + goal.unit + " today");
+                number(daily_goal) + " " + goal.unit + " today");
             if (y < height - (show_focus ? 7 : 3))
                 canvas.text(8, y++, "total " + number(metrics.total) + " | current goal " +
                     number(metrics.current_goal) + " | net " + (metrics.net >= 0 ? "+" : "") + number(metrics.net));
@@ -995,7 +1161,7 @@ GoalMetrics goal_metrics(const State& state, const Goal& goal, const std::string
         result.elapsed_days = std::max<long long>(1, std::chrono::duration_cast<std::chrono::hours>(
             parse_time(date + "T12:00:00") - parse_time(goal.start_date + "T12:00:00")).count() / 24 + 1);
     } catch (const std::exception&) {}
-    const double expected = goal.daily_goal * result.elapsed_days;
+    const double expected = goal_expected_on(state, goal, date);
     result.current_goal = goal.target > 0 ? std::min(goal.target, expected) : expected;
     result.net = result.total - result.current_goal;
     return result;
@@ -1006,7 +1172,7 @@ void goals(Canvas& canvas, const State& state, int width, int height) {
     canvas.text(3, 2, "GOALS  cumulative progress and target pace");
     canvas.hline(2, 4, width - 4);
     if (state.goals.empty()) {
-        canvas.text(3, 6, "No goals yet. Press n to create one.");
+        canvas.text(3, 6, "No goals yet. Press n for a regular goal or r for a reading goal.");
     } else {
         const int selected = std::clamp(state.goal_row, 0, static_cast<int>(state.goals.size()) - 1);
         int y = 6;
@@ -1014,10 +1180,20 @@ void goals(Canvas& canvas, const State& state, int width, int height) {
         for (int i = 0; i < static_cast<int>(state.goals.size()) && y < height - 10; ++i) {
             const auto& goal = state.goals[i];
             const auto metrics = goal_metrics(state, goal, today);
-            canvas.text(3, y++, std::string(i == selected ? "> " : "  ") +
-                clip(goal.title, std::max(10, width - 60)) + "  total " + number(metrics.total) +
-                "  goal " + number(metrics.current_goal) + "  net " +
-                (metrics.net >= 0 ? "+" : "") + number(metrics.net) + "  daily " + number(goal.daily_goal));
+            if (goal.book_mode) {
+                canvas.text(3, y++, std::string(i == selected ? "> " : "  ") +
+                    clip(goal.title, std::max(10, width - 70)) + "  READING  page " +
+                    number(book_current_page_on(state, goal, today)) + "/" + number(goal.end_page) +
+                    "  read " + number(metrics.total) + "  goal " + number(metrics.current_goal) +
+                    "  net " + (metrics.net >= 0 ? "+" : "") + number(metrics.net) + "  daily " +
+                    number(goal_daily_target_on(state, goal, today)));
+            } else {
+                canvas.text(3, y++, std::string(i == selected ? "> " : "  ") +
+                    clip(goal.title, std::max(10, width - 60)) + "  total " + number(metrics.total) +
+                    "  goal " + number(metrics.current_goal) + "  net " +
+                    (metrics.net >= 0 ? "+" : "") + number(metrics.net) + "  daily " +
+                    number(goal_daily_target_on(state, goal, today)));
+            }
         }
         const auto& goal = state.goals[selected];
         const auto current = goal_metrics(state, goal, today);
@@ -1030,7 +1206,8 @@ void goals(Canvas& canvas, const State& state, int width, int height) {
                 parse_time(goal.target_date + "T12:00:00") - parse_time(today + "T12:00:00")).count() / 24 + 1);
         } catch (const std::exception&) {}
         const long long elapsed_days = current.elapsed_days;
-        const double daily_goal = goal.daily_goal > 0 ? goal.daily_goal :
+        const double active_daily_goal = goal_daily_target_on(state, goal, today);
+        const double daily_goal = active_daily_goal > 0 ? active_daily_goal :
             (days_left > 0 ? goal.target / std::max<long long>(1, elapsed_days + days_left - 1) : 0);
         const double current_goal = current.current_goal;
         const double net = current.net;
@@ -1044,12 +1221,23 @@ void goals(Canvas& canvas, const State& state, int width, int height) {
             "[" + std::string(filled, '=') + std::string(bar_width - filled, '.') + "] " +
                 number(100.0 * total / goal.target) + "%" :
             "DAILY GOAL - no final total");
-        canvas.text(3, detail_y + 2, "Daily goal " + number(daily_goal) + " " + goal.unit +
-            "  |  Current total " + number(total));
-        canvas.text(3, detail_y + 3, "Current goal " + number(current_goal) + "  |  NET " +
-            (net >= 0 ? "+" : "") + number(net));
-        canvas.text(3, detail_y + 4, (has_final_goal ? "Remaining " + number(remaining) + " " + goal.unit :
-            "No final goal") + "  |  Actual pace " + number(actual_pace) + "/day");
+        if (goal.book_mode) {
+            const double current_page = book_current_page_on(state, goal, today);
+            canvas.text(3, detail_y + 2, "Pages  start " + number(goal.start_page) + "  |  current " +
+                number(current_page) + "  |  end " + number(goal.end_page));
+            canvas.text(3, detail_y + 3, "Daily goal " + number(daily_goal) + " pages  |  read " +
+                number(total) + "  |  remaining " + number(remaining));
+            canvas.text(3, detail_y + 4, "Current goal " + number(current_goal) + "  |  NET " +
+                (net >= 0 ? "+" : "") + number(net) + "  |  actual pace " +
+                number(actual_pace) + "/day");
+        } else {
+            canvas.text(3, detail_y + 2, "Daily goal " + number(daily_goal) + " " + goal.unit +
+                "  |  Current total " + number(total));
+            canvas.text(3, detail_y + 3, "Current goal " + number(current_goal) + "  |  NET " +
+                (net >= 0 ? "+" : "") + number(net));
+            canvas.text(3, detail_y + 4, (has_final_goal ? "Remaining " + number(remaining) + " " + goal.unit :
+                "No final goal") + "  |  Actual pace " + number(actual_pace) + "/day");
+        }
         canvas.text(3, detail_y + 5, "Projected finish " + projection +
             (goal.target_date.empty() ? "  |  no final due date" : "  |  due " + goal.target_date));
         std::vector<const GoalEntry*> entries;
@@ -1064,7 +1252,7 @@ void goals(Canvas& canvas, const State& state, int width, int height) {
         if (entries.empty()) recent += "no datapoints yet";
         canvas.text(3, detail_y + 6, clip(recent, width - 6));
     }
-    canvas.text(2, height - 2, "j/k select  n new  + add datapoint  e edit  Delete remove  M Views");
+    canvas.text(2, height - 2, "j/k select  n new  r reading  + progress  e edit  Delete remove  M Views");
 }
 
 void edit_goal(Canvas& canvas, const State& state, int width, int height) {
@@ -1073,32 +1261,41 @@ void edit_goal(Canvas& canvas, const State& state, int width, int height) {
         return state.editing_goal_id && goal.id == *state.editing_goal_id;
     });
     if (found == state.goals.end()) { canvas.text(3, 3, "Goal not found."); return; }
-    canvas.text(3, 2, "EDIT GOAL  #" + std::to_string(found->id));
+    canvas.text(3, 2, std::string(found->book_mode ? "EDIT READING GOAL  #" : "EDIT GOAL  #") +
+        std::to_string(found->id));
     canvas.hline(2, 4, width - 4);
-    const std::array<std::pair<std::string, std::string>, 6> fields{{
-        {"Name", found->title},
-        {"Unit", found->unit},
-        {"Final goal", found->target > 0 ? number(found->target) : "none"},
-        {"Daily goal", number(found->daily_goal)},
-        {"Start date", found->start_date},
-        {"Final due", found->target_date.empty() ? "none" : found->target_date}
-    }};
+    const std::vector<std::pair<std::string, std::string>> fields = found->book_mode ?
+        std::vector<std::pair<std::string, std::string>>{
+            {"Name", found->title}, {"Starting page", number(found->start_page)},
+            {"End page", number(found->end_page)},
+            {"Current page", number(book_current_page_on(state, *found, date_iso(state.now)))},
+            {"Daily pages", number(found->daily_goal)}, {"Start date", found->start_date},
+            {"Final due", found->target_date.empty() ? "none" : found->target_date}
+        } : std::vector<std::pair<std::string, std::string>>{
+            {"Name", found->title}, {"Unit", found->unit},
+            {"Final goal", found->target > 0 ? number(found->target) : "none"},
+            {"Daily goal", number(found->daily_goal)}, {"Start date", found->start_date},
+            {"Final due", found->target_date.empty() ? "none" : found->target_date}
+        };
     for (int i = 0; i < static_cast<int>(fields.size()); ++i) {
         const int y = 5 + i;
         canvas.text(3, y, std::string(i == state.goal_edit_row ? "> " : "  ") +
             fields[i].first + "  " + clip(fields[i].second, width - 22));
     }
-    constexpr int comment_y = 12;
+    const int comment_row = static_cast<int>(fields.size());
+    const int comment_y = found->book_mode ? 13 : 12;
     const int comment_height = std::max(3, height - comment_y - 3);
     const int comment_width = std::max(8, width - 6);
     canvas.box(3, comment_y, comment_width, comment_height);
-    canvas.text(5, comment_y, std::string(state.goal_edit_row == 6 ? "> Comment " : " Comment "));
+    canvas.text(5, comment_y, std::string(state.goal_edit_row == comment_row ? "> Comment " : " Comment "));
     const std::string shown = found->comment.empty() ? "No comment yet. Press Enter to write." : found->comment;
     const auto lines = wrap_lines(shown, std::max(1, comment_width - 4));
     for (int i = 0; i < static_cast<int>(lines.size()) && i < comment_height - 2; ++i)
         canvas.text(5, comment_y + 1 + i, lines[i]);
-    canvas.text(3, height - 3, "Select a field and press Enter. Use '-' to clear Final goal or Final due.");
-    canvas.text(2, height - 2, state.goal_edit_row == 6 ?
+    canvas.text(3, height - 3, found->book_mode ?
+        "Current page records progress; Daily pages changes from today; '-' clears Final due." :
+        "Select a field and press Enter. Use '-' to clear Final goal or Final due.");
+    canvas.text(2, height - 2, state.goal_edit_row == comment_row ?
         "Enter write comment  Ctrl+S save  Esc cancel/return  j/k field" :
         "j/k field  e/Enter change  Esc goals  Ctrl+Z undo  Ctrl+Y redo");
 }
@@ -1175,9 +1372,10 @@ void gantt(Canvas& canvas, const State& state, int width, int height) {
             projected = date_iso(state.now + std::chrono::hours(24 * static_cast<long long>(
                 std::ceil((goal.target - total) / pace))));
         std::string inferred;
-        if (goal.target > 0 && goal.daily_goal > 0) try {
+        const double daily_goal = goal_daily_target_on(state, goal, date_iso(state.now));
+        if (goal.target > 0 && daily_goal > 0) try {
             const long long days = std::max<long long>(1,
-                static_cast<long long>(std::ceil(goal.target / goal.daily_goal)));
+                static_cast<long long>(std::ceil(goal.target / daily_goal)));
             inferred = date_iso(local_date_point(goal.start_date) + std::chrono::hours(24 * (days - 1)));
         } catch (const std::exception&) {}
         const std::string end = !goal.target_date.empty() ? goal.target_date : inferred;
@@ -1272,6 +1470,7 @@ std::vector<std::string> render(const State& state, int width, int height) {
         else if (state.view == View::Tracker) tracker(main, state, width - rail_width, height, false);
         else if (state.view == View::EditSession) edit_session(main, state, width - rail_width, height);
         else if (state.view == View::SessionTaskPicker) session_task_picker(main, state, width - rail_width, height);
+        else if (state.view == View::TrackerBoundary) tracker_boundary(main, state, width - rail_width, height);
         else if (state.view == View::Allowances) allowances(main, state, width - rail_width, height, false);
         else if (state.view == View::Todos) todos(main, state, width - rail_width, height, false);
         else if (state.view == View::Deadlines) deadlines(main, state, width - rail_width, height);
@@ -1293,6 +1492,7 @@ std::vector<std::string> render(const State& state, int width, int height) {
     else if (state.view == View::Tracker) tracker(canvas, state, width, height);
     else if (state.view == View::EditSession) edit_session(canvas, state, width, height);
     else if (state.view == View::SessionTaskPicker) session_task_picker(canvas, state, width, height);
+    else if (state.view == View::TrackerBoundary) tracker_boundary(canvas, state, width, height);
     else if (state.view == View::Allowances) allowances(canvas, state, width, height);
     else if (state.view == View::Todos) todos(canvas, state, width, height);
     else if (state.view == View::Deadlines) deadlines(canvas, state, width, height);

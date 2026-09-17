@@ -12,7 +12,7 @@ using Clock = std::chrono::system_clock;
 using TimePoint = Clock::time_point;
 
 enum class Status { Backlog, Ready, Doing, Done };
-enum class View { Board, Calendar, Task, EditTask, TaskChecklist, Tracker, EditSession, SessionTaskPicker,
+enum class View { Board, Calendar, Task, EditTask, TaskChecklist, Tracker, EditSession, SessionTaskPicker, TrackerBoundary,
                   Allowances, Todos, Deadlines, Goals, EditGoal, Gantt, Settings, Menu, Help };
 
 struct Project {
@@ -100,6 +100,9 @@ struct Goal {
     std::string start_date;
     std::string target_date;
     std::string comment;
+    bool book_mode{};
+    double start_page{};
+    double end_page{};
 };
 
 struct GoalEntry {
@@ -108,6 +111,18 @@ struct GoalEntry {
     std::string date;
     double amount{};
     std::string note;
+};
+
+struct GoalDailyTarget {
+    int goal_id{};
+    std::string effective_date;
+    double amount{};
+};
+
+struct GoalPaceReset {
+    int goal_id{};
+    std::string effective_date;
+    double baseline{};
 };
 
 struct State {
@@ -123,6 +138,8 @@ struct State {
     std::vector<TodoException> todo_exceptions;
     std::vector<Goal> goals;
     std::vector<GoalEntry> goal_entries;
+    std::vector<GoalDailyTarget> goal_daily_targets;
+    std::vector<GoalPaceReset> goal_pace_resets;
     int project_index{};
     int column{};
     int row{};
@@ -132,9 +149,18 @@ struct State {
     bool project_focused{};
     bool all_projects{};
     int tracker_row{};
+    bool tracker_timeline_focused{};
+    int tracker_cursor_minutes{720};
+    bool tracker_boundary_dragging{};
     int session_edit_row{};
     int task_picker_row{};
+    std::string task_picker_query;
+    bool task_picker_search_focused{true};
     std::optional<int> editing_session_id;
+    bool session_picker_returns_tracker{};
+    std::optional<int> boundary_left_session_id;
+    std::optional<int> boundary_right_session_id;
+    TimePoint tracker_boundary{now};
     TimePoint tracker_date{now};
     bool calendar_selecting_tracker{};
     bool calendar_selecting_task_due{};
@@ -186,9 +212,18 @@ std::string duration(long long seconds);
 std::string date_iso(TimePoint point);
 std::string date_human(TimePoint point);
 TimePoint parse_time(const std::string& value);
+TimePoint resolve_split_time(TimePoint midpoint, TimePoint tracker_date,
+                             const std::string& entered_date, const std::string& entered_time);
+std::vector<int> spread_timeline_marks(const std::vector<int>& preferred, int width);
+char activity_symbol(int id, bool allowance = false, bool sleep = false);
+bool activity_matches_query(const Task& task, const Project* project, const std::string& query);
 void set_app_timezone(const std::string& timezone);
 bool todo_visible_on(const State& state, const Todo& todo, const std::string& date);
 std::string todo_title_on(const State& state, const Todo& todo, const std::string& date);
+double goal_daily_target_on(const State& state, const Goal& goal, const std::string& date);
+double goal_expected_on(const State& state, const Goal& goal, const std::string& date);
+bool goal_complete_on(const State& state, const Goal& goal, const std::string& date);
+double book_current_page_on(const State& state, const Goal& goal, const std::string& date);
 
 class Store {
   public:
@@ -219,6 +254,8 @@ class Store {
     void start_timer(int task_id, TimePoint now);
     void stop_timer(TimePoint now);
     int add_session(int task_id, TimePoint started_at, TimePoint ended_at);
+    int split_session(int session_id, TimePoint split_at, int second_task_id);
+    void move_session_boundary(int left_session_id, int right_session_id, TimePoint boundary);
     void update_session(int session_id, TimePoint started_at, TimePoint ended_at);
     void update_session_start(int session_id, TimePoint started_at);
     void update_session_task(int session_id, int task_id);
@@ -238,8 +275,10 @@ class Store {
     void end_todo_before(int todo_id, const std::string& date);
     int add_goal(const std::string& title, const std::string& unit, double target,
                  const std::string& start_date, const std::string& target_date,
-                 double daily_goal = 0, const std::string& comment = {});
-    void update_goal(const Goal& goal);
+                 double daily_goal = 0, const std::string& comment = {}, bool book_mode = false,
+                 double start_page = 0, double end_page = 0);
+    void update_goal(const Goal& goal, const std::string& daily_goal_effective_date);
+    void reset_goal_pace(int goal_id, const std::string& date, double baseline);
     void delete_goal(int goal_id);
     int add_goal_entry(int goal_id, const std::string& date, double amount, const std::string& note);
     void clear_goal_entries_on(int goal_id, const std::string& date);
