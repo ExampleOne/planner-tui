@@ -52,16 +52,20 @@ Status status_from(const char* value) {
     const std::string text = value ? value : "backlog";
     if (text == "ready") return Status::Ready;
     if (text == "doing") return Status::Doing;
+    if (text == "blocked") return Status::Blocked;
     if (text == "done") return Status::Done;
     return Status::Backlog;
 }
 
 std::string status_db(Status status) {
-    std::string result = status_name(status);
-    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return result;
+    switch (status) {
+        case Status::Backlog: return "backlog";
+        case Status::Ready: return "ready";
+        case Status::Doing: return "doing";
+        case Status::Blocked: return "blocked";
+        case Status::Done: return "done";
+    }
+    return "backlog";
 }
 
 long long civil_day_number(const std::string& value) {
@@ -85,16 +89,17 @@ long long civil_day_number(const std::string& value) {
 
 std::string status_name(Status status) {
     switch (status) {
-        case Status::Backlog: return "BACKLOG";
+        case Status::Backlog: return "IDEAS";
         case Status::Ready: return "READY";
         case Status::Doing: return "DOING";
+        case Status::Blocked: return "BLOCKED";
         case Status::Done: return "DONE";
     }
-    return "BACKLOG";
+    return "IDEAS";
 }
 
 Status next_status(Status status) {
-    return static_cast<Status>((static_cast<int>(status) + 1) % 4);
+    return static_cast<Status>((static_cast<int>(status) + 1) % kStatusCount);
 }
 
 const Project* selected_project(const State& state) {
@@ -127,7 +132,7 @@ std::vector<const Task*> visible_tasks(const State& state, Status status) {
 }
 
 const Task* selected_task(const State& state) {
-    const auto tasks = visible_tasks(state, static_cast<Status>(std::clamp(state.column, 0, 3)));
+    const auto tasks = visible_tasks(state, static_cast<Status>(std::clamp(state.column, 0, kStatusCount - 1)));
     if (tasks.empty()) return nullptr;
     return tasks[std::clamp(state.row, 0, static_cast<int>(tasks.size()) - 1)];
 }

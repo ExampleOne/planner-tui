@@ -11,7 +11,8 @@ namespace planner {
 using Clock = std::chrono::system_clock;
 using TimePoint = Clock::time_point;
 
-enum class Status { Backlog, Ready, Doing, Done };
+enum class Status { Backlog, Ready, Doing, Blocked, Done };
+inline constexpr int kStatusCount = 5;
 enum class View { Board, Calendar, Task, EditTask, TaskChecklist, Tracker, EditSession, SessionTaskPicker, TrackerBoundary,
                   Allowances, Todos, Deadlines, Goals, EditGoal, Gantt, Settings, Menu, Help };
 
@@ -143,7 +144,7 @@ struct State {
     int project_index{};
     int column{};
     int row{};
-    std::array<int, 4> board_scroll{};
+    std::array<int, kStatusCount> board_scroll{};
     int schedule_row{};
     bool today_focused{};
     bool project_focused{};

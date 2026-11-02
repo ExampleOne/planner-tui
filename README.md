@@ -7,7 +7,7 @@ specified before code is written.
 ## Proposed first release
 
 - Projects with independent Kanban boards
-- Configurable columns, initially `Backlog`, `Ready`, `Doing`, and `Done`
+- Configurable columns, initially `Ideas`, `Ready`, `Doing`, `Blocked`, and `Done`
 - One active task at a time
 - Start, pause, resume, and stop a timer for that task
 - Calendar showing deadlines and scheduled focus sessions
@@ -41,12 +41,12 @@ Run with persistent personal data:
 The default database is `~/.local/share/planner-tui/planner.db`. An alternative can
 be selected with `--data FILE`.
 
-The interactive board uses a bright, redundant color scheme: yellow Backlog, cyan
-Ready, magenta Doing, and green Done. A running timer uses bold white text on a
+The interactive board uses a bright, redundant color scheme: yellow Ideas, cyan
+Ready, magenta Doing, red Blocked, and green Done. A running timer uses bold white text on a
 green background. Selection also uses reverse video and textual markers, so the
 interface remains readable in monochrome terminals.
 
-On a Board with a visible project column, press Left from Backlog to focus Projects,
+On a Board with a visible project column, press Left from Ideas to focus Projects,
 then press Left again to focus the Daily Calendar. There, Up/Down selects scheduled
 tasks; moving above the first entry selects Current Activity. `Space` pauses or
 resumes that activity, `t` starts a scheduled task, `s` stops and clears the active
@@ -126,7 +126,7 @@ press `b` to open their shared-boundary editor. Use `h`/`l` for five-minute adju
 `H`/`L` for fifteen minutes, or `e` for an exact date and time, then `Enter` to save.
 Both operations are atomic and undoable; moving a boundary preserves combined tracked time.
 The tracked-interval activity picker groups activities as Project folders containing
-status folders (`Backlog`, `Ready`, `Doing`, and `Done`). `j`/`k` moves between activities
+status folders (`Ideas`, `Ready`, `Doing`, `Blocked`, and `Done`). `j`/`k` moves between activities
 without selecting folder headings, and the tree scrolls automatically to keep the selected
 activity visible. It opens with Search focused: type to filter by activity, tag, or project,
 press `Enter` to move into the results, then use `j`/`k` and `Enter` to choose. Press `/` from
@@ -152,7 +152,7 @@ In Task editing, pressing `Enter` on Due date opens the same calendar-style sele
 `Enter` sets the deadline, `c` clears it, and `Esc` cancels.
 
 On the Board, `Space` picks up the selected card, arrow keys move it between columns
-or reorder it vertically, and `Space` drops it. From Backlog, move Left into Projects,
+or reorder it vertically, and `Space` drops it. From Ideas, move Left into Projects,
 choose a destination with Up/Down, then press `Space` to transfer and drop the card;
 its tracking history moves with it. Outside the Board, `Space` continues
 to pause or resume the focus timer. Quitting does not stop a running timer: its open
