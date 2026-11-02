@@ -434,8 +434,9 @@ void board(Canvas& canvas, const State& state, int width, int height, bool show_
         "  session " + duration(stats.session), board_width - 4));
 
     if (compact) {
-        const Status status = static_cast<Status>(std::clamp(state.column, 0, 3));
-        canvas.text(2, 4, status_name(status) + "  [column " + std::to_string(state.column + 1) + " of 4]");
+        const Status status = static_cast<Status>(std::clamp(state.column, 0, kStatusCount - 1));
+        canvas.text(2, 4, status_name(status) + "  [column " + std::to_string(state.column + 1) + " of " +
+            std::to_string(kStatusCount) + "]");
         const auto tasks = visible_tasks(state, status);
         const int capacity = std::max(1, (panel - 5) / 2);
         int first = std::clamp(state.board_scroll[state.column], 0,
@@ -457,8 +458,8 @@ void board(Canvas& canvas, const State& state, int width, int height, bool show_
         if (first > 0) canvas.text(width - 3, 4, "^");
         if (first + capacity < static_cast<int>(tasks.size())) canvas.text(width - 3, panel - 1, "v");
     } else {
-        const int column_width = std::max(12, board_width / 4);
-        for (int column = 0; column < 4; ++column) {
+        const int column_width = std::max(12, board_width / kStatusCount);
+        for (int column = 0; column < kStatusCount; ++column) {
             const int x = start_x + column * column_width;
             const bool selected_column = state.column == column && !state.project_focused;
             canvas.text(x + 1, 4, std::string(selected_column ? "> " : "  ") +

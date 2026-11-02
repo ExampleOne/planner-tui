@@ -405,7 +405,7 @@ void rendering() {
             "aggregate board does not combine project tasks");
     state.all_projects = false;
     auto compact = planner::render_text(state, 40, 12);
-    require(compact.find("column 1 of 4") != std::string::npos, "compact board was not selected");
+    require(compact.find("column 1 of 5") != std::string::npos, "compact board was not selected");
 
     const int scrolling_project = state.projects[0].id;
     for (int i = 0; i < 10; ++i)
@@ -421,7 +421,8 @@ void rendering() {
     require(compact_scrolled.find('^') != std::string::npos,
             "compact board lacks an upward overflow indicator");
     state.board_scroll[1] = 0;
-    const auto column_scrolled = planner::render_text(state, 80, 16);
+    // Five columns beside the Today rail need about 140 columns before 10-character titles fit.
+    const auto column_scrolled = planner::render_text(state, 140, 16);
     require(column_scrolled.find("Overflow 9") != std::string::npos &&
             state.board_scroll[1] == 0,
             "wide board did not preserve per-column scrolling");
@@ -760,6 +761,31 @@ void undo_and_redo_history() {
     require(!store.redo(), "divergent change did not clear redo history");
 }
 
+void blocked_status() {
+    require(planner::next_status(planner::Status::Doing) == planner::Status::Blocked,
+            "Blocked does not follow Doing in the status cycle");
+    require(planner::next_status(planner::Status::Blocked) == planner::Status::Done,
+            "Blocked does not precede Done in the status cycle");
+    require(planner::next_status(planner::Status::Done) == planner::Status::Backlog,
+            "status cycle does not wrap from Done back to Ideas");
+    require(planner::status_name(planner::Status::Backlog) == "IDEAS" &&
+            planner::status_name(planner::Status::Blocked) == "BLOCKED",
+            "status labels do not match the board");
+
+    planner::Store store(":memory:");
+    store.initialize();
+    const int project = store.add_project("Blocking");
+    const int task = store.add_task(project, "Waiting on review", planner::Status::Blocked);
+    const auto state = store.load(planner::Clock::now());
+    const auto found = std::find_if(state.tasks.begin(), state.tasks.end(), [task](const planner::Task& item) {
+        return item.id == task;
+    });
+    require(found != state.tasks.end() && found->status == planner::Status::Blocked,
+            "blocked status was not persisted");
+    require(planner::visible_tasks(state, planner::Status::Blocked).size() == 1,
+            "blocked column does not list the blocked task");
+}
+
 }  // namespace
 
 int main() {
@@ -767,6 +793,7 @@ int main() {
         model_and_storage();
         timezone_handling();
         undo_and_redo_history();
+        blocked_status();
         rendering();
         std::cout << "All planner tests passed.\n";
         return 0;

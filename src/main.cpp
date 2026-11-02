@@ -75,14 +75,20 @@ void normalize(planner::State& state) {
         return;
     }
     state.project_index = std::clamp(state.project_index, 0, static_cast<int>(state.projects.size()) - 1);
-    state.column = std::clamp(state.column, 0, 3);
+    state.column = std::clamp(state.column, 0, planner::kStatusCount - 1);
     const auto tasks = planner::visible_tasks(state, static_cast<planner::Status>(state.column));
     state.row = tasks.empty() ? 0 : std::clamp(state.row, 0, static_cast<int>(tasks.size()) - 1);
-    for (int column = 0; column < 4; ++column) {
+    for (int column = 0; column < planner::kStatusCount; ++column) {
         const int count = static_cast<int>(planner::visible_tasks(
             state, static_cast<planner::Status>(column)).size());
         state.board_scroll[column] = std::clamp(state.board_scroll[column], 0, std::max(0, count - 1));
     }
+}
+
+// Colour pair for each board column, in Status order: yellow, cyan, magenta, red, green.
+int column_pair(int column) {
+    static constexpr std::array<int, planner::kStatusCount> pairs{2, 3, 4, 14, 5};
+    return pairs[column];
 }
 
 int board_capacity(int width, int height, bool show_focus) {
@@ -91,7 +97,7 @@ int board_capacity(int width, int height, bool show_focus) {
 }
 
 void reveal_board_selection(planner::State& state, int width, int height, bool show_focus) {
-    const int column = std::clamp(state.column, 0, 3);
+    const int column = std::clamp(state.column, 0, planner::kStatusCount - 1);
     const int capacity = board_capacity(width, height, show_focus);
     int& first = state.board_scroll[column];
     if (state.row < first) first = state.row;
@@ -967,10 +973,10 @@ void paint_colors(const planner::State& state, int width, int height) {
                         state.project_focused ? A_BOLD | A_REVERSE : A_BOLD);
             const int start = rail + sidebar + 1;
             const int board_width = main_width - sidebar - 2;
-            const int column_width = std::max(12, board_width / 4);
-            for (int column = 0; column < 4; ++column) {
+            const int column_width = std::max(12, board_width / planner::kStatusCount);
+            for (int column = 0; column < planner::kStatusCount; ++column) {
                 const int x = start + column * column_width;
-                color_range(4, x, std::min(column_width, width - x - 1), 2 + column);
+                color_range(4, x, std::min(column_width, width - x - 1), column_pair(column));
                 const auto tasks = planner::visible_tasks(state, static_cast<planner::Status>(column));
                 const int capacity = std::max(1, (height - 8) / 3);
                 int first = std::clamp(state.board_scroll[column], 0,
@@ -981,7 +987,7 @@ void paint_colors(const planner::State& state, int width, int height) {
                 }
                 for (int row = first; row < static_cast<int>(tasks.size()) && row < first + capacity; ++row) {
                     const bool selected = !state.project_focused && state.column == column && state.row == row;
-                    const int pair = selected && column == 0 ? 15 : 2 + column;
+                    const int pair = selected && column == 0 ? 15 : column_pair(column);
                     const int attributes = selected && column != 0 ? A_BOLD | A_REVERSE : A_BOLD;
                     for (int dy = 0; dy < 3; ++dy)
                         color_range(6 + (row - first) * 3 + dy, x,
@@ -1071,7 +1077,7 @@ void paint_colors(const planner::State& state, int width, int height) {
     color_range(timer_y, 1, width - 2, state.timer_task_id ? 6 : (state.paused_task_id ? 2 : 1));
     color_range(height - 4, 1, width - 2, state.timer_task_id ? 6 : (state.paused_task_id ? 2 : 1));
     if (compact) {
-        color_range(4, 1, width - 2, 2 + state.column);
+        color_range(4, 1, width - 2, column_pair(state.column));
         const auto tasks = planner::visible_tasks(state, static_cast<planner::Status>(state.column));
         const int capacity = std::max(1, (timer_y - 5) / 2);
         int first = std::clamp(state.board_scroll[state.column], 0,
@@ -1079,7 +1085,7 @@ void paint_colors(const planner::State& state, int width, int height) {
         if (state.row < first) first = state.row;
         else if (state.row >= first + capacity) first = state.row - capacity + 1;
         const int selected_y = 6 + (state.row - first) * 2;
-        color_range(selected_y, 1, width - 2, state.column == 0 ? 15 : 2 + state.column,
+        color_range(selected_y, 1, width - 2, state.column == 0 ? 15 : column_pair(state.column),
                     state.column == 0 ? A_BOLD : A_BOLD | A_REVERSE);
         return;
     }
@@ -1090,10 +1096,10 @@ void paint_colors(const planner::State& state, int width, int height) {
                 state.project_focused ? A_BOLD | A_REVERSE : A_BOLD);
     const int start_x = sidebar + 1;
     const int board_width = width - start_x - 1;
-    const int column_width = std::max(12, board_width / 4);
-    for (int column = 0; column < 4; ++column) {
+    const int column_width = std::max(12, board_width / planner::kStatusCount);
+    for (int column = 0; column < planner::kStatusCount; ++column) {
         const int x = start_x + column * column_width;
-        color_range(4, x, std::min(column_width, width - x - 1), 2 + column);
+        color_range(4, x, std::min(column_width, width - x - 1), column_pair(column));
         const auto tasks = planner::visible_tasks(state, static_cast<planner::Status>(column));
         const int capacity = std::max(1, (timer_y - 6) / 3);
         int first = std::clamp(state.board_scroll[column], 0,
@@ -1104,7 +1110,7 @@ void paint_colors(const planner::State& state, int width, int height) {
         }
         for (int row = first; row < static_cast<int>(tasks.size()) && row < first + capacity; ++row) {
             const bool selected = !state.project_focused && state.column == column && state.row == row;
-            const int pair = selected && column == 0 ? 15 : 2 + column;
+            const int pair = selected && column == 0 ? 15 : column_pair(column);
             const int attributes = selected && column != 0 ? A_BOLD | A_REVERSE : A_BOLD;
             const int y = 6 + (row - first) * 3;
             color_range(y, x, std::min(column_width - 1, width - x - 1), pair, attributes);
@@ -1120,7 +1126,7 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
         start_color();
         use_default_colors();
         init_pair(1, COLOR_WHITE, -1);    // chrome
-        init_pair(2, COLOR_YELLOW, -1);   // backlog
+        init_pair(2, COLOR_YELLOW, -1);   // ideas
         init_pair(3, COLOR_CYAN, -1);     // ready and headings
         init_pair(4, COLOR_MAGENTA, -1);  // doing
         init_pair(5, COLOR_GREEN, -1);    // done
@@ -1133,10 +1139,12 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
         init_pair(12, COLOR_WHITE, COLOR_MAGENTA);
         init_pair(13, COLOR_BLACK, COLOR_WHITE);
         init_pair(14, COLOR_RED, -1);
-        init_pair(15, COLOR_BLACK, COLOR_YELLOW);  // readable selected Backlog card
+        init_pair(15, COLOR_BLACK, COLOR_YELLOW);  // readable selected Ideas card
         init_pair(16, COLOR_BLACK, COLORS >= 256 ? 180 : COLOR_YELLOW);  // sleep: light tan/brown
     }
     bool running = true;
+    bool repaint_requested = false;
+    auto last_repaint = std::chrono::steady_clock::now();
     while (running) {
         if (!fixed_clock) state.now = planner::Clock::now();
         int height = 0, width = 0; getmaxyx(stdscr, height, width);
@@ -1147,6 +1155,13 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
             reveal_board_selection(state, main_width, height, width < 90);
         attr_set(A_NORMAL, 0, nullptr);
         bkgdset(static_cast<chtype>(' ') | COLOR_PAIR(0));
+        // The terminal can change while the app is unfocused, and refresh() only sends changed cells,
+        // so repaint every cell now and then, and whenever it is requested.
+        if (repaint_requested || std::chrono::steady_clock::now() - last_repaint >= std::chrono::seconds(2)) {
+            redrawwin(stdscr);
+            repaint_requested = false;
+            last_repaint = std::chrono::steady_clock::now();
+        }
         erase();
         const auto rows = planner::render(state, width, height);
         for (int y = 0; y < static_cast<int>(rows.size()); ++y) {
@@ -1158,6 +1173,10 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
         const int key = getch();
         state.message.clear();
         if (key == ERR) continue;
+        if (key == 12 || key == KEY_RESIZE) {  // Ctrl-L or a terminal resize: repaint on the next frame
+            repaint_requested = true;
+            continue;
+        }
         if (state.view == planner::View::SessionTaskPicker && state.task_picker_search_focused &&
             (key == '\n' || key == KEY_ENTER)) {
             const auto tasks = picker_tasks(state);
@@ -2249,7 +2268,7 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
             int target_column = state.column;
             int target_row = state.row;
             if (key == 'h' || key == KEY_LEFT) { target_column = std::max(0, state.column - 1); target_row = 0; }
-            else if (key == 'l' || key == KEY_RIGHT) { target_column = std::min(3, state.column + 1); target_row = 0; }
+            else if (key == 'l' || key == KEY_RIGHT) { target_column = std::min(planner::kStatusCount - 1, state.column + 1); target_row = 0; }
             else if (key == 'k' || key == KEY_UP) target_row = std::max(0, state.row - 1);
             else target_row = state.row + 1;
             store.checkpoint();
@@ -2427,7 +2446,7 @@ void run_tui(planner::State& state, planner::Store& store, bool fixed_clock) {
             else state.column = std::max(0, state.column - 1);
             state.row = 0;
         } else if ((state.view == planner::View::Board || state.view == planner::View::Task) && (key == 'l' || key == KEY_RIGHT)) {
-            state.column = std::min(3, state.column + 1); state.row = 0;
+            state.column = std::min(planner::kStatusCount - 1, state.column + 1); state.row = 0;
         } else if ((state.view == planner::View::Board || state.view == planner::View::Task) && (key == 'k' || key == KEY_UP)) {
             state.row = std::max(0, state.row - 1);
         } else if ((state.view == planner::View::Board || state.view == planner::View::Task) && (key == 'j' || key == KEY_DOWN)) {

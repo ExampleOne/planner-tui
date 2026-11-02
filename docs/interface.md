@@ -16,16 +16,16 @@ Target size: 120 x 32 or larger.
 ┌ Planner ─────────────────────────────────────────────────────────── Wed 19 Aug ┐
 │ PROJECTS        │ Personal reset                                                │
 │                 │                                                               │
-│ > Personal reset│  BACKLOG         READY           DOING           DONE         │
-│   Job search    │ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌─────────┐ │
-│   Learn C++     │ │ Sort papers │ │ Update CV  ! │ │ Call adviser │ │ Set up  │ │
-│   Home          │ │              │ │ Fri 21 Aug  │ │              │ │ calendar│ │
-│                 │ └──────────────┘ └──────────────┘ └──────────────┘ └─────────┘ │
-│ + New project   │ ┌──────────────┐ ┌──────────────┐                  ┌─────────┐ │
-│                 │ │ Book dentist │ │ Find 3 roles │                  │ Go for  │ │
-│                 │ └──────────────┘ └──────────────┘                  │ a walk  │ │
-│                 │                                                    └─────────┘ │
-│                 │                                                               │
+│ > Personal reset│  IDEAS       READY       DOING       BLOCKED     DONE        │
+│   Job search    │ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐  │
+│   Learn C++     │ │Read book│ │Update CV│ │Call mum │ │Waiting  │ │Set up   │  │
+│   Home          │ └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘  │
+│                 │ ┌─────────┐ ┌─────────┐                                      │
+│ + New project   │ │Dentist  │ │Find role│                                      │
+│                 │ └─────────┘ └─────────┘                                      │
+│                 │                                                              │
+│                 │                                                              │
+│                 │                                                              │
 ├─────────────────┴───────────────────────────────────────────────────────────────┤
 │ FOCUS  Call adviser                                      00:18:42  [Running]    │
 │        Today: 00:43:10   Task total: 01:12:36             Space pause  s stop   │
